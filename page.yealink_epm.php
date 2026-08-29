@@ -138,7 +138,6 @@ $saved_global_dialnow_timeout = "4";
 $file_dialnow_patterns = [];
 $global_cfg_file = $tftp_dir . "y000000000000.cfg";
 
-// ONLY parse if file explicitly exists on disk
 if (file_exists($global_cfg_file)) {
     $g_content = @file($global_cfg_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
     if ($g_content) {
@@ -347,8 +346,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
     $existing_macs = [];
     if (is_array($existing_cfg_files)) {
         foreach ($existing_cfg_files as $cfg_file) {
-            $mac_name = strtoupper(pathinfo($cfg_file, PATHINFO_FILENAME));
-            if ($mac_name !== 'Y000000000000') {
+            $mac_name = strtolower(pathinfo($cfg_file, PATHINFO_FILENAME));
+            if ($mac_name !== 'y000000000000') {
                 $existing_macs[] = $mac_name;
             }
         }
@@ -377,9 +376,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
     }
 
     $yealink_ouis = [
-        '001565', '0004F2', '805EC0', 'E434D7', 
-        '805E0C', '249AB8', '706979', 'B44B36', 
-        '108C70', '286B35', '001A4D', '805EC1'
+        '001565', '0004f2', '805ec0', 'e434d7', 
+        '805e0c', '249ab8', '706979', 'b44b36', 
+        '108c70', '286b35', '001a4d', '805ec1'
     ];
 
     $discovered = [];
@@ -389,7 +388,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
             preg_match('/\(([\d\.]+)\)\s+at\s+([0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2})/i', $line, $matches)) {
             
             $ip = $matches[1];
-            $mac_clean = strtoupper(str_replace([':', '-'], '', $matches[2]));
+            $mac_clean = strtolower(str_replace([':', '-'], '', $matches[2]));
 
             if (strpos($ip, $prefix . '.') !== 0 || $mac_clean === '000000000000') {
                 continue;
@@ -416,7 +415,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
     if (ob_get_length()) { ob_clean(); }
     header('Content-Type: application/json');
 
-    $scanned_mac = strtoupper(preg_replace('/[^a-fA-F0-9]/', '', $_POST['scanned_mac'] ?? ''));
+    $scanned_mac = strtolower(preg_replace('/[^a-fA-F0-9]/', '', $_POST['scanned_mac'] ?? ''));
     $scanned_ext = trim($_POST['scanned_ext'] ?? '');
     $scanned_tpl = trim($_POST['scanned_template'] ?? '');
     $should_notify = isset($_POST['auto_provision']) && $_POST['auto_provision'] === '1';
@@ -429,18 +428,27 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
         $cfg_body = "#!version:{$cfg_version}\n\n";
         $cfg_body .= "# Phone Model: Yealink\n";
         $cfg_body .= "# Template: {$tpl_to_write}\n\n";
-        $cfg_body .= "account.1.sip_server_host = {$saved_global_server_ip}\n";
         if (!empty($scanned_ext)) {
+            $cfg_body .= "account.1.enable = 1\n";
             $cfg_body .= "account.1.label = {$ext_name}\n";
             $cfg_body .= "account.1.display_name = {$ext_name}\n";
             $cfg_body .= "account.1.auth_name = {$scanned_ext}\n";
             $cfg_body .= "account.1.user_name = {$scanned_ext}\n";
             $cfg_body .= "account.1.password = {$ext_secret}\n";
+            $cfg_body .= "account.1.sip_server = {$saved_global_server_ip}\n";
+            $cfg_body .= "account.1.sip_server_host = {$saved_global_server_ip}\n";
+            $cfg_body .= "account.1.sip_server_port = {$default_sip_port}\n";
+            $cfg_body .= "account.1.port = {$default_sip_port}\n";
+            $cfg_body .= "linekey.1.type = 15\n";
+            $cfg_body .= "linekey.1.line = 1\n";
+            $cfg_body .= "linekey.1.value = {$scanned_ext}\n";
+            $cfg_body .= "linekey.1.label = {$ext_name}\n";
         }
 
         if (!empty($scanned_tpl) && file_exists($tftp_dir . $scanned_tpl)) {
             $tpl_content = file_get_contents($tftp_dir . $scanned_tpl);
-            $tpl_content = preg_replace('/^account\.1\.sip_server_host\s*=.*$/m', '', $tpl_content);
+            $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
+            $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
             $cfg_body .= "\n##### INHERITED TEMPLATE SETTINGS ({$scanned_tpl}) #####\n";
             $cfg_body .= $tpl_content;
         }
@@ -561,7 +569,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         }
     }
 
-    // Ensure global config exists; create with defaults if missing
     if (!file_exists($tftp_dir . "y000000000000.cfg")) {
         generateAndSaveGlobalConfig($formData, $cfg_version, $detected_ip, $tftp_dir);
     }
@@ -630,14 +637,15 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         $is_logo_disabled = true;
     }
 
-    $generated_template_cfg = "#!version:{$cfg_version}\n\n";
-    $generated_template_cfg .= "## Yealink Template Configuration File ##\n";
+    $generated_template_cfg = "## Yealink Template Configuration File ##\n";
     $generated_template_cfg .= "# Phone Model: {$formData['phone_model']}\n";
     $generated_template_cfg .= "# Expansion Model: {$formData['exp_model']}\n";
     $generated_template_cfg .= "# Expansion Count: {$formData['exp_count']}\n\n";
 
+    $generated_template_cfg .= "account.1.sip_server = {$server_ip_target}\n";
     $generated_template_cfg .= "account.1.sip_server_host = {$server_ip_target}\n";
     $generated_template_cfg .= "account.1.sip_server_port = {$formData['sip_port']}\n";
+    $generated_template_cfg .= "account.1.port = {$formData['sip_port']}\n";
     $generated_template_cfg .= "account.1.sip_listen_port = {$formData['sip_listen_port']}\n";
     $generated_template_cfg .= "voice_mail.number.1 = {$formData['voicemail_number']}\n\n";
 
@@ -709,7 +717,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     $status = "Saved Template: {$tpl_filename} to {$tftp_dir}";
 
     $_POST['template_to_load'] = $tpl_filename;
-} // END OF save_template POST BLOCK
+}
 
 // ============================================================================
 // 7. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
@@ -724,7 +732,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
     if ($action === 'delete_selected') {
         $deleted_count = 0;
         foreach ($selected_macs as $smac) {
-            $f_path = $tftp_dir . $smac . ".cfg";
+            $clean_mac = strtolower(trim($smac));
+            $f_path = $tftp_dir . $clean_mac . ".cfg";
             if (file_exists($f_path)) {
                 @unlink($f_path);
                 $deleted_count++;
@@ -736,8 +745,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
         $all_macs = [];
         if (is_array($all_cfg_files)) {
             foreach ($all_cfg_files as $cf) {
-                $mname = strtoupper(pathinfo($cf, PATHINFO_FILENAME));
-                if ($mname !== 'Y000000000000' && strpos(strtolower($cf), 'template') === false) {
+                $mname = strtolower(pathinfo($cf, PATHINFO_FILENAME));
+                if ($mname !== 'y000000000000' && strpos(strtolower($cf), 'template') === false) {
                     $all_macs[] = $mname;
                 }
             }
@@ -747,7 +756,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
         $filter_template = ($action === 'rebuild_filtered') ? trim($_POST['global_filter_template'] ?? '') : '';
 
         if ($action === 'single_rebuild') {
-            $target_mac = strtoupper(trim($_POST['single_mac'] ?? ''));
+            $target_mac = strtolower(trim($_POST['single_mac'] ?? ''));
             $targets = !empty($target_mac) ? [$target_mac] : [];
             $override_model = trim($_POST['single_model'] ?? '');
             $do_autoprovision = isset($_POST['single_provision']);
@@ -758,7 +767,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
             $do_reboot = isset($_POST['reboot_filtered']);
             $override_model = '';
         } else {
-            $targets = ($action === 'rebuild_selected') ? $selected_macs : $all_macs;
+            $targets = ($action === 'rebuild_selected') ? array_map('strtolower', $selected_macs) : $all_macs;
             $do_autoprovision = ($action === 'rebuild_selected') ? isset($_POST['auto_provision_selected']) : isset($_POST['auto_provision_all']);
             $do_reboot = ($action === 'rebuild_selected') ? isset($_POST['reboot_selected']) : isset($_POST['reboot_phones']);
             $override_model = '';
@@ -774,9 +783,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
         $rebuilt = 0;
 
         foreach ($targets as $smac) {
-            $f_path = $tftp_dir . $smac . ".cfg";
-            $new_tpl = $assigned_tpls[$smac] ?? '';
-            $new_ext = $assigned_exts[$smac] ?? '';
+            $clean_mac = strtolower(trim($smac));
+            $f_path = $tftp_dir . $clean_mac . ".cfg";
+            $new_tpl = $assigned_tpls[$clean_mac] ?? ($assigned_tpls[strtoupper($clean_mac)] ?? '');
+            $new_ext = $assigned_exts[$clean_mac] ?? ($assigned_exts[strtoupper($clean_mac)] ?? '');
 
             if (file_exists($f_path)) {
                 $file_content = file_get_contents($f_path);
@@ -814,7 +824,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
 
                 $updated_lines = [];
                 $has_tpl_comment = false;
-                $has_sip_host = false;
 
                 $base_lines = explode("\n", $base_content);
 
@@ -825,25 +834,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
                 foreach ($base_lines as $f_line) {
                     if (preg_match('/^#!version:/i', $f_line)) {
                         $updated_lines[] = "#!version:{$cfg_version}";
+                    } elseif (preg_match('/^account\.1\./i', $f_line)) {
+                        continue;
+                    } elseif (preg_match('/^linekey\.1\./i', $f_line)) {
+                        continue;
                     } elseif (preg_match('/^#\s*Phone\s*Model\s*:\s*(.+)$/i', $f_line, $m)) {
                         $model_val = !empty($override_model) ? $override_model : trim($m[1]);
                         $updated_lines[] = "# Phone Model: {$model_val}";
                     } elseif (preg_match('/^#\s*Template\s*:/i', $f_line)) {
                         $updated_lines[] = "# Template: {$tpl_to_write}";
                         $has_tpl_comment = true;
-                    } elseif (preg_match('/^account\.1\.sip_server_host\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.sip_server_host = {$saved_global_server_ip}";
-                        $has_sip_host = true;
-                    } elseif (preg_match('/^account\.1\.auth_name\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.auth_name = {$new_ext}";
-                    } elseif (preg_match('/^account\.1\.user_name\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.user_name = {$new_ext}";
-                    } elseif (preg_match('/^account\.1\.display_name\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.display_name = {$new_ext_name}";
-                    } elseif (preg_match('/^account\.1\.label\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.label = {$new_ext_name}";
-                    } elseif (preg_match('/^account\.1\.password\s*=/i', $f_line)) {
-                        $updated_lines[] = "account.1.password = {$new_ext_secret}";
                     } else {
                         $updated_lines[] = $f_line;
                     }
@@ -852,19 +852,38 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
                 if (!$has_tpl_comment) {
                     array_splice($updated_lines, 2, 0, "# Template: {$tpl_to_write}");
                 }
-                if (!$has_sip_host) {
-                    array_splice($updated_lines, 3, 0, "account.1.sip_server_host = {$saved_global_server_ip}");
+
+                if (!empty($new_ext)) {
+                    $account_block = [
+                        "account.1.enable = 1",
+                        "account.1.label = {$new_ext_name}",
+                        "account.1.display_name = {$new_ext_name}",
+                        "account.1.auth_name = {$new_ext}",
+                        "account.1.user_name = {$new_ext}",
+                        "account.1.password = {$new_ext_secret}",
+                        "account.1.sip_server = {$saved_global_server_ip}",
+                        "account.1.sip_server_host = {$saved_global_server_ip}",
+                        "account.1.sip_server_port = {$default_sip_port}",
+                        "account.1.port = {$default_sip_port}",
+                        "linekey.1.type = 15",
+                        "linekey.1.line = 1",
+                        "linekey.1.value = {$new_ext}",
+                        "linekey.1.label = {$new_ext_name}"
+                    ];
+                    array_splice($updated_lines, 3, 0, $account_block);
                 }
 
                 $final_cfg = implode("\n", $updated_lines);
 
                 if (!empty($new_tpl) && file_exists($tftp_dir . $new_tpl)) {
                     $tpl_content = file_get_contents($tftp_dir . $new_tpl);
-                    $tpl_content = preg_replace('/^account\.1\.sip_server_host\s*=.*$/m', '', $tpl_content);
+                    $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
+                    $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
                     $final_cfg = rtrim($final_cfg) . "\n\n##### INHERITED TEMPLATE SETTINGS ({$new_tpl}) #####\n" . $tpl_content;
                 }
 
                 @file_put_contents($f_path, $final_cfg);
+                @chown($f_path, 'asterisk');
 
                 if ($notify_event !== 'none' && !empty($new_ext)) {
                     sendSipNotify($new_ext, $notify_event);
@@ -889,9 +908,9 @@ $managed_devices = [];
 if (is_array($existing_files)) {
     foreach ($existing_files as $file_path) {
         $b_name = basename($file_path);
-        $file_name_no_ext = strtoupper(pathinfo($b_name, PATHINFO_FILENAME));
+        $file_name_no_ext = strtolower(pathinfo($b_name, PATHINFO_FILENAME));
         
-        if ($file_name_no_ext === 'Y000000000000') continue;
+        if ($file_name_no_ext === 'y000000000000') continue;
 
         if (strpos(strtolower($b_name), 'template') !== false) {
             $available_templates[$b_name] = $b_name;
@@ -1011,13 +1030,13 @@ if (isset($_POST['load_template']) && !empty($_POST['template_to_load'])) {
             if (strpos($t_line, '=') === false || strpos($t_line, '#') === 0) continue;
             list($k, $v) = array_map('trim', explode('=', $t_line, 2));
 
-            if ($k === 'auto_provision.server.url' || $k === 'security.user_password' || $k === 'account.1.sip_server_host') {
+            if ($k === 'auto_provision.server.url' || $k === 'security.user_password' || strpos($k, 'account.1.sip_server') === 0) {
                 continue;
             }
 
             $is_parsed_tpl = false;
 
-            if ($k === 'account.1.sip_server_port') { $formData['sip_port'] = $v; $is_parsed_tpl = true; }
+            if ($k === 'account.1.sip_server_port' || $k === 'account.1.port') { $formData['sip_port'] = $v; $is_parsed_tpl = true; }
             if ($k === 'account.1.sip_listen_port') { $formData['sip_listen_port'] = $v; $is_parsed_tpl = true; }
             if ($k === 'voice_mail.number.1') { $formData['voicemail_number'] = $v; $is_parsed_tpl = true; }
             if ($k === 'account.1.ringtone.ring_type') { $formData['ringtone_file'] = $v; $is_parsed_tpl = true; }
@@ -1171,8 +1190,8 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
     }
 
     function openSingleRebuildModal(mac, model, template) {
-        document.getElementById('single_mac_input').value = mac;
-        document.getElementById('single_rebuild_mac_title').innerText = mac;
+        document.getElementById('single_mac_input').value = mac.toLowerCase();
+        document.getElementById('single_rebuild_mac_title').innerText = mac.toLowerCase();
         
         var modelSelect = document.getElementById('single_model_select');
         if (modelSelect) modelSelect.value = model || 'manual';
@@ -1188,7 +1207,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
     }
 
     function submitSingleRebuildModal() {
-        var mac = document.getElementById('single_mac_input').value;
+        var mac = document.getElementById('single_mac_input').value.toLowerCase();
         var selectedTpl = document.getElementById('single_template_select').value;
         
         var phoneTplElem = document.getElementById('phone_tpl_' + mac);
@@ -1333,7 +1352,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
     }
 
     function submitManualAddDevice() {
-        var rawMac = document.getElementById('manual_mac').value.replace(/[^a-fA-F0-9]/g, '');
+        var rawMac = document.getElementById('manual_mac').value.replace(/[^a-fA-F0-9]/g, '').toLowerCase();
         var extVal = document.getElementById('manual_ext').value;
         var tplVal = document.getElementById('manual_tpl').value;
         var autoProvision = document.getElementById('manual_provision').checked ? '1' : '0';
@@ -1443,7 +1462,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         btn.innerText = 'Adding...';
 
         var formData = new FormData();
-        formData.append('scanned_mac', mac);
+        formData.append('scanned_mac', mac.toLowerCase());
         formData.append('scanned_ext', extVal);
         formData.append('scanned_template', tplVal);
         formData.append('auto_provision', autoProvision);
@@ -1547,7 +1566,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         </div>
 
         <br>
-        <div style="display:flex; justify-content:space-between; gap:10px;">
+        <div style="display:flex; justify-space-between; gap:10px;">
             <button type="button" id="manual_add_btn" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="submitManualAddDevice()">Create Device Config</button>
             <button type="button" class="gen-btn-danger" style="margin-top:0;" onclick="closeManualAddModal()">Cancel / Close</button>
         </div>
@@ -1987,7 +2006,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <input type="hidden" id="single_ext_input" name="single_ext" value="">
             <input type="hidden" id="single_mac_input" name="single_mac" value="">
 
-            <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="display:flex; justify-space-between; align-items:center;">
                 <h3>Registered Extensions & Devices</h3>
                 <div style="display:flex; gap:10px;">
                     <button type="button" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="openManualAddModal()">+ Manually Add Device</button>
