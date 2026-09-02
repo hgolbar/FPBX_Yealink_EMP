@@ -37,7 +37,7 @@ if (!file_exists($tftp_dir)) {
 }
 
 // ============================================================================
-// 2. DETECT GLOBAL HTTPS REDIRECT & DETERMINE PROVISIONING PORT
+// 2. DETECT GLOBAL HTTPS REDIRECT & DETERMINE PROVISIONING PORT / GUI ADDR
 // ============================================================================
 
 $sysadmin_redirect = false;
@@ -48,11 +48,35 @@ if (function_exists('sysadmin_get_storage_settings')) {
     }
 }
 
-// Extract base host name or IP address
-$detected_host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_ADDR'] ?? '192.168.1.1';
-if (strpos($detected_host, ':') !== false) {
-    $detected_host = explode(':', $detected_host)[0];
+// Extract host from HTTP headers or server environment
+$raw_host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_ADDR'] ?? '';
+if (strpos($raw_host, ':') !== false) {
+    $raw_host = explode(':', $raw_host)[0];
 }
+
+// Determine true LAN GUI IP address (bypassing loopback 127.0.0.1 / 127.0.1.1)
+$get_lan_ip = function() use ($raw_host) {
+    if (!empty($raw_host) && filter_var($raw_host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && strpos($raw_host, '127.') !== 0) {
+        return $raw_host;
+    }
+    if (!empty($_SERVER['SERVER_ADDR']) && filter_var($_SERVER['SERVER_ADDR'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && strpos($_SERVER['SERVER_ADDR'], '127.') !== 0) {
+        return $_SERVER['SERVER_ADDR'];
+    }
+    
+    // Fallback: Query active interface IP via socket connection test
+    $sock = @fsockopen('8.8.8.8', 53, $errno, $errstr, 1);
+    if ($sock) {
+        $sockname = @getsockname($sock, $local_ip, $local_port);
+        @fclose($sock);
+        if ($sockname && filter_var($local_ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && strpos($local_ip, '127.') !== 0) {
+            return $local_ip;
+        }
+    }
+    
+    return '192.168.1.1';
+};
+
+$detected_host = $get_lan_ip();
 
 // Automatically route to Port 83 if Port 80 enforces HTTPS redirects
 if ($sysadmin_redirect) {
@@ -66,6 +90,32 @@ if ($sysadmin_redirect) {
 // ============================================================================
 // 3. HELPER FUNCTIONS
 // ============================================================================
+
+function getArpTableMap() {
+    $arp_map = [];
+    $arp_output = [];
+    if (file_exists('/proc/net/arp')) {
+        $arp_lines = @file('/proc/net/arp', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($arp_lines) {
+            array_shift($arp_lines);
+            $arp_output = $arp_lines;
+        }
+    }
+    if (empty($arp_output)) {
+        exec("ip neighbor show 2>/dev/null || arp -an 2>/dev/null", $arp_output);
+    }
+    foreach ($arp_output as $line) {
+        if (preg_match('/^([\d\.]+)\s+.*\s+([0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2})/i', $line, $m) ||
+            preg_match('/\(([\d\.]+)\)\s+at\s+([0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2}[:\-][0-9a-fA-F]{2})/i', $line, $m)) {
+            $ip = $m[1];
+            $mac_clean = strtolower(str_replace([':', '-'], '', $m[2]));
+            if (strlen($mac_clean) === 12) {
+                $arp_map[$mac_clean] = $ip;
+            }
+        }
+    }
+    return $arp_map;
+}
 
 function sendSipNotify($ext_or_mac, $event_type = 'check-sync') {
     $ext = preg_replace('/[^0-9]/', '', $ext_or_mac);
@@ -694,9 +744,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
                 $generated_template_cfg .= "################################################\n\n";
                 $has_memkeys = true;
             }
-            $pickup = $formData["memkey_{$i}_pickup"] ?? '';
+            $pickup = isset($formData["memkey_{$i}_pickup"]) ? $formData["memkey_{$i}_pickup"] : '**';
+            if ($pickup === '') { $pickup = '**'; }
+            
             $generated_template_cfg .= "memorykey.{$i}.value = {$val}\n";
-            if (!empty($pickup)) {
+            if ($pickup !== 'none') {
                 $generated_template_cfg .= "memorykey.{$i}.pickup_value = {$pickup}\n";
             }
             $generated_template_cfg .= "memorykey.{$i}.type = 16\n\n";
@@ -708,9 +760,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         $type = $formData["linekey_{$i}_type"] ?? '16';
         $val = $formData["linekey_{$i}_value"] ?? '';
         $lbl = $formData["linekey_{$i}_label"] ?? '';
-        $pickup = $formData["linekey_{$i}_pickup"] ?? '';
+        $pickup = isset($formData["linekey_{$i}_pickup"]) ? $formData["linekey_{$i}_pickup"] : '**';
+        if ($pickup === '') { $pickup = '**'; }
 
-        if (!empty($val) || !empty($lbl) || !empty($pickup)) {
+        if (!empty($val) || !empty($lbl) || ($pickup !== 'none' && !empty($pickup))) {
             if (!$has_linekeys) {
                 $generated_template_cfg .= "################################################\n";
                 $generated_template_cfg .= "##         Line Keys                            ##\n";
@@ -718,7 +771,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
                 $has_linekeys = true;
             }
             if (!empty($val)) $generated_template_cfg .= "linekey.{$i}.value = {$val}\n";
-            if (!empty($pickup)) $generated_template_cfg .= "linekey.{$i}.pickup_value = {$pickup}\n";
+            if ($pickup !== 'none') {
+                $generated_template_cfg .= "linekey.{$i}.pickup_value = {$pickup}\n";
+            }
             $generated_template_cfg .= "linekey.{$i}.type = {$type}\n";
             if (!empty($lbl)) $generated_template_cfg .= "linekey.{$i}.label = {$lbl}\n\n";
         }
@@ -761,7 +816,22 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
     $selected_macs = $_POST['selected_phones'] ?? [];
     $assigned_tpls = $_POST['phone_template'] ?? [];
     $assigned_exts = $_POST['phone_extension'] ?? [];
+    $edited_macs = $_POST['edited_mac'] ?? [];
     $bulk_override_tpl = trim($_POST['bulk_selected_template'] ?? '');
+
+    // Handle MAC edits before performing actions
+    foreach ($edited_macs as $orig_mac => $new_mac) {
+        $clean_orig = strtolower(trim($orig_mac));
+        $clean_new = strtolower(preg_replace('/[^a-fA-F0-9]/', '', $new_mac));
+        if (!empty($clean_new) && strlen($clean_new) === 12 && $clean_orig !== $clean_new) {
+            $orig_path = $tftp_dir . $clean_orig . ".cfg";
+            $new_path = $tftp_dir . $clean_new . ".cfg";
+            if (file_exists($orig_path) && !file_exists($new_path)) {
+                @rename($orig_path, $new_path);
+                @chown($new_path, 'asterisk');
+            }
+        }
+    }
 
     if ($action === 'delete_selected') {
         $deleted_count = 0;
@@ -825,7 +895,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
             } else {
                 $new_tpl = $assigned_tpls[$clean_mac] ?? ($assigned_tpls[strtoupper($clean_mac)] ?? '');
             }
-            
+
             $new_ext = $assigned_exts[$clean_mac] ?? ($assigned_exts[strtoupper($clean_mac)] ?? '');
 
             if (file_exists($f_path)) {
@@ -944,6 +1014,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
 $existing_files = glob($tftp_dir . "*.cfg");
 $available_templates = [];
 $managed_devices = [];
+$assigned_extensions_map = [];
+$arp_table = getArpTableMap();
 
 if (is_array($existing_files)) {
     foreach ($existing_files as $file_path) {
@@ -985,14 +1057,29 @@ if (is_array($existing_files)) {
             }
         }
 
+        if (!empty($ext_num)) {
+            $assigned_extensions_map[$ext_num] = true;
+        }
+
+        $ip_addr = $arp_table[$file_name_no_ext] ?? 'Unknown / Offline';
+
         $managed_devices[] = [
             'mac' => $file_name_no_ext,
+            'ip' => $ip_addr,
             'file' => $b_name,
             'model' => $phone_model_read,
             'template' => $template_used,
             'ext' => $ext_num,
             'label' => $ext_label
         ];
+    }
+}
+
+// Build array of unassigned extensions available for scanner/manual entry
+$available_extensions = [];
+foreach ($all_extensions as $e_id => $e_data) {
+    if (!isset($assigned_extensions_map[(string)$e_id])) {
+        $available_extensions[$e_id] = $e_data;
     }
 }
 
@@ -1081,8 +1168,8 @@ if (isset($_POST['load_template']) && !empty($_POST['template_to_load'])) {
             if ($k === 'voice_mail.number.1') { $formData['voicemail_number'] = $v; $is_parsed_tpl = true; }
             if ($k === 'account.1.ringtone.ring_type') { $formData['ringtone_file'] = $v; $is_parsed_tpl = true; }
             if ($k === 'ringtone.url') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
+            if ($k === 'phone_setting.ringtone') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
             if ($k === 'phone_setting.lcd_logo.mode') { $is_parsed_tpl = true; }
-	     if ($k === 'phone_setting.ringtone') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
             if ($k === 'lcd_logo.url' || $k === 'phone_setting.background_image') { 
                 if (empty($v) || $v === 'Config:default') {
                     $formData['logo_file'] = '';
@@ -1205,6 +1292,8 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 <!-- ============================================================================ -->
 
 <script>
+    var scannedDeviceMacs = [];
+
     function switchTab(tabId) {
         document.querySelectorAll('.gen-tab-content').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('.gen-tab-btn').forEach(el => el.classList.remove('active'));
@@ -1217,6 +1306,26 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
     function toggleSelectAllPhones(master) {
         var checkboxes = document.querySelectorAll('.phone_checkbox');
         checkboxes.forEach(cb => cb.checked = master.checked);
+    }
+
+    function enableMacEdit(mac) {
+        var inputElem = document.getElementById('mac_input_' + mac);
+        if (inputElem) {
+            inputElem.readOnly = false;
+            inputElem.style.backgroundColor = '#ffffff';
+            inputElem.style.borderColor = '#007bff';
+            inputElem.focus();
+        }
+    }
+
+    function applyBulkTemplateToScanned(selectedTpl) {
+        if (!selectedTpl) return;
+        scannedDeviceMacs.forEach(mac => {
+            var selectElem = document.getElementById('scan_tpl_' + mac);
+            if (selectElem) {
+                selectElem.value = selectedTpl;
+            }
+        });
     }
 
     function triggerDeviceAction(actionName) {
@@ -1377,7 +1486,8 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 
     function closeScanModal() {
         document.getElementById('scanModal').style.display = 'none';
-        location.reload();
+        window.location.hash = 'tab_devices';
+        window.location.reload();
     }
 
     function openManualAddModal() {
@@ -1389,7 +1499,8 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 
     function closeManualAddModal() {
         document.getElementById('manualAddModal').style.display = 'none';
-        location.reload();
+        window.location.hash = 'tab_devices';
+        window.location.reload();
     }
 
     function submitManualAddDevice() {
@@ -1448,6 +1559,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
     function runSubnetScan() {
         var subnet = document.getElementById('scan_subnet').value;
         var tbody = document.getElementById('scan_results_body');
+        scannedDeviceMacs = [];
         tbody.innerHTML = '<tr><td colspan="6">Scanning subnet asynchronously... Please wait...</td></tr>';
         
         fetch('?display=yealink_epm&action=scan_network&subnet=' + encodeURIComponent(subnet))
@@ -1459,8 +1571,9 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                     return;
                 }
                 data.devices.forEach(dev => {
+                    scannedDeviceMacs.push(dev.mac);
                     var extOptions = `<option value="">-- Unassigned --</option>`;
-                    <?php foreach ($all_extensions as $ext_id => $ext_data): ?>
+                    <?php foreach ($available_extensions as $ext_id => $ext_data): ?>
                         extOptions += `<option value="<?= $ext_id ?>"><?= $ext_id ?> - <?= htmlspecialchars($ext_data['display_name']) ?></option>`;
                     <?php endforeach; ?>
 
@@ -1508,7 +1621,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         formData.append('scanned_template', tplVal);
         formData.append('auto_provision', autoProvision);
 
-        fetch('?display=yealink_epm&action=add_scanned_device', {
+        return fetch('?display=yealink_epm&action=add_scanned_device', {
             method: 'POST',
             body: formData
         })
@@ -1523,7 +1636,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 
             if (data.status === 'success') {
                 var row = document.getElementById('scan_row_' + mac);
-                row.style.background = '#d4edda';
+                if (row) row.style.background = '#d4edda';
                 btn.innerHTML = 'Added &#10003;';
                 btn.style.background = '#6c757d';
             } else {
@@ -1538,6 +1651,33 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             btn.style.background = '#dc3545';
         });
     }
+
+    function submitAddAllScannedDevices() {
+        if (scannedDeviceMacs.length === 0) {
+            alert('No devices available to add.');
+            return;
+        }
+
+        var btn = document.getElementById('add_all_btn');
+        btn.disabled = true;
+        btn.innerText = 'Adding All...';
+
+        var promises = scannedDeviceMacs.map(mac => submitAddScannedDevice(mac));
+        
+        Promise.all(promises).then(() => {
+            btn.innerText = 'Done!';
+            setTimeout(() => {
+                closeScanModal();
+            }, 800);
+        });
+    }
+
+    // Retain active tab state across refreshes / hash state
+    document.addEventListener("DOMContentLoaded", function() {
+        if (window.location.hash === '#tab_devices' || '<?= $formData['active_tab'] ?>' === 'tab_devices') {
+            switchTab('tab_devices');
+        }
+    });
 </script>
 
 <form id="delete_file_form" method="POST" style="display:none;">
@@ -1550,10 +1690,25 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 <div id="scanModal" class="gen-modal">
     <div class="gen-modal-content">
         <h3>Subnet MAC Address Scanner (Yealink)</h3>
-        <label>Enter Subnet Base IP (e.g., 192.168.X.X):</label>
-        <div style="display:flex; gap:10px;">
-            <input type="text" id="scan_subnet" class="gen-full-width" value="<?= $detected_host ?>">
-            <button type="button" class="gen-btn" style="margin-top:0;" onclick="runSubnetScan()">Scan Subnet</button>
+        
+        <div style="display:flex; justify-content:space-between; align-items:flex-end; gap:10px; margin-bottom:10px;">
+            <div style="flex:1;">
+                <label style="margin-top:0;">Enter Subnet Base IP / FQDN:</label>
+                <div style="display:flex; gap:10px;">
+                    <input type="text" id="scan_subnet" class="gen-full-width" value="<?= $detected_host ?>">
+                    <button type="button" class="gen-btn" style="margin-top:0;" onclick="runSubnetScan()">Scan Subnet</button>
+                </div>
+            </div>
+
+            <div style="flex:1;">
+                <label style="margin-top:0;">Bulk Assign Template to All Scanned:</label>
+                <select id="bulk_scanned_template" class="gen-full-width" onchange="applyBulkTemplateToScanned(this.value)">
+                    <option value="">-- Select Template to Apply All --</option>
+                    <?php foreach ($available_templates as $tpl_file => $tpl_label): ?>
+                        <option value="<?= htmlspecialchars($tpl_file) ?>"><?= htmlspecialchars($tpl_label) ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
         </div>
         
         <table class="scan-table">
@@ -1572,7 +1727,10 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             </tbody>
         </table>
         <br>
-        <button type="button" class="gen-btn-danger" onclick="closeScanModal()">Done / Close</button>
+        <div style="display:flex; justify-content:space-between; gap:10px;">
+            <button type="button" id="add_all_btn" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="submitAddAllScannedDevices()">+ Add All Devices & Close</button>
+            <button type="button" class="gen-btn-danger" style="margin-top:0;" onclick="closeScanModal()">Done / Close</button>
+        </div>
     </div>
 </div>
 
@@ -1587,7 +1745,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         <label style="margin-top:10px;">Assign Extension:</label>
         <select id="manual_ext" class="gen-full-width">
             <option value="">-- Unassigned --</option>
-            <?php foreach ($all_extensions as $ext_id => $ext_data): ?>
+            <?php foreach ($available_extensions as $ext_id => $ext_data): ?>
                 <option value="<?= $ext_id ?>"><?= $ext_id ?> - <?= htmlspecialchars($ext_data['display_name']) ?></option>
             <?php endforeach; ?>
         </select>
@@ -1970,7 +2128,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                         </select>
                         <input type="text" name="linekey_<?= $i ?>_value" placeholder="Line Key <?= $i ?> Extension" value="<?= htmlspecialchars($formData["linekey_{$i}_value"] ?? '') ?>">
                         <input type="text" name="linekey_<?= $i ?>_label" placeholder="Label" value="<?= htmlspecialchars($formData["linekey_{$i}_label"] ?? '') ?>">
-                        <input type="text" name="linekey_<?= $i ?>_pickup" placeholder="Pickup (**)" value="<?= htmlspecialchars($formData["linekey_{$i}_pickup"] ?? '') ?>">
+                        <input type="text" name="linekey_<?= $i ?>_pickup" placeholder="Pickup (**)" value="<?= htmlspecialchars($formData["linekey_{$i}_pickup"] ?? '**') ?>">
                     <?php endif; ?>
                 </div>
             <?php endfor; ?>
@@ -1989,7 +2147,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <?php for ($i = 1; $i <= 180; $i++): ?>
                 <div id="memkey_row_<?= $i ?>" class="gen-key-row" style="display: <?= ($i <= $max_memkeys) ? 'flex' : 'none' ?>;">
                     <input type="text" name="memkey_<?= $i ?>_value" placeholder="Memory Key <?= $i ?> Extension" value="<?= htmlspecialchars($formData["memkey_{$i}_value"] ?? '') ?>">
-                    <input type="text" name="memkey_<?= $i ?>_pickup" placeholder="Pickup Value" value="<?= htmlspecialchars($formData["memkey_{$i}_pickup"] ?? '') ?>">
+                    <input type="text" name="memkey_<?= $i ?>_pickup" placeholder="Pickup Value" value="<?= htmlspecialchars($formData["memkey_{$i}_pickup"] ?? '**') ?>">
                 </div>
             <?php endfor; ?>
             </div>
@@ -2056,9 +2214,9 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <input type="hidden" id="single_ext_input" name="single_ext" value="">
             <input type="hidden" id="single_mac_input" name="single_mac" value="">
 
-            <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="display:flex; justify-space-between; align-items:center;">
                 <h3>Registered Extensions & Devices</h3>
-                <div style="display:flex; gap:10px;">
+                <div style="display:flex; gap:10px; align-items:center;">
                     <button type="button" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="openManualAddModal()">+ Manually Add Device</button>
                     <button type="button" class="gen-btn" style="margin-top:0; background:#17a2b8;" onclick="openScanModal()">Scan Subnet for New Phones</button>
                 </div>
@@ -2069,6 +2227,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                     <tr>
                         <th style="width: 50px; text-align:center;"><input type="checkbox" onclick="toggleSelectAllPhones(this)"></th>
                         <th>MAC Address</th>
+                        <th>IP Address</th>
                         <th>Brand</th>
                         <th>Model</th>
                         <th>Template</th>
@@ -2077,7 +2236,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                 </thead>
                 <tbody>
                     <?php if (empty($managed_devices)): ?>
-                        <tr><td colspan="6" style="text-align:center; color:#777;">No configured device files found in /tftpboot/</td></tr>
+                        <tr><td colspan="7" style="text-align:center; color:#777;">No configured device files found in /tftpboot/</td></tr>
                     <?php else: ?>
                         <?php foreach ($managed_devices as $dev): 
                             $clean_ext = preg_replace('/[^0-9]/', '', $dev['ext']);
@@ -2095,7 +2254,33 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                                         <input type="checkbox" name="selected_phones[]" class="phone_checkbox" value="<?= htmlspecialchars($dev['mac']) ?>">
                                     </div>
                                 </td>
-                                <td><b><?= htmlspecialchars($dev['mac']) ?></b></td>
+                                <td>
+                                    <div style="display:flex; align-items:center; gap:5px;">
+                                        <input type="text" 
+                                               id="mac_input_<?= htmlspecialchars($dev['mac']) ?>" 
+                                               name="edited_mac[<?= htmlspecialchars($dev['mac']) ?>]" 
+                                               value="<?= htmlspecialchars($dev['mac']) ?>" 
+                                               readonly 
+                                               style="padding:4px; font-weight:bold; width:120px; font-family:monospace; text-transform:lowercase; border-radius:4px; border:1px solid #ccc; background-color:#e9ecef;">
+                                        
+                                        <button type="button" 
+                                                title="Edit MAC Address" 
+                                                onclick="enableMacEdit('<?= htmlspecialchars($dev['mac']) ?>')" 
+                                                style="background:none; border:none; cursor:pointer; padding:2px 4px; display:inline-flex; align-items:center;">
+                                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                                            </svg>
+                                        </button>
+                                    </div>
+                                </td>
+                                <td>
+                                    <?php if ($dev['ip'] !== 'Unknown / Offline'): ?>
+                                        <a href="http://<?= htmlspecialchars($dev['ip']) ?>" target="_blank" style="text-decoration:none; font-weight:bold; color:#007bff;"><?= htmlspecialchars($dev['ip']) ?></a>
+                                    <?php else: ?>
+                                        <span style="color:#888; font-style:italic;"><?= htmlspecialchars($dev['ip']) ?></span>
+                                    <?php endif; ?>
+                                </td>
                                 <td>Yealink</td>
                                 <td><?= htmlspecialchars($dev['model']) ?></td>
                                 <td>
