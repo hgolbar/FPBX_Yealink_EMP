@@ -2,6 +2,41 @@
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
 // ============================================================================
+// 0. Module Assets & Dynamic Symlink Mapping
+// ============================================================================
+$module_name = 'yealink_epm'; 
+$module_root = $amp_conf['AMPWEBROOT'] . '/admin/modules/' . $module_name;
+
+/**
+ * Safely creates a symlink from a source target to a destination link path.
+ * Clears conflicting items beforehand without disrupting valid structures.
+ */
+function deploy_module_symlink($source, $target) {
+    if (file_exists($target) || is_link($target)) {
+        // If it's a real directory and NOT a link, do not delete it to prevent losing data
+        if (is_dir($target) && !is_link($target)) {
+            out("Warning: A physical folder already exists at " . $target . ". Skipping link generation.");
+            return false;
+        }
+        @unlink($target);
+    }
+
+    if (@symlink($source, $target)) {
+        @chown($target, 'asterisk');
+        @chgrp($target, 'asterisk');
+        return true;
+    }
+    return false;
+}
+
+// 1. Create the outward links inside /var/www/html/admin/modules/yealink_epm/
+// This maps 'tftpboot' to system /tftpboot, and 'PhoneSettings' directly to the web root location
+deploy_module_symlink('/tftpboot', $module_root . '/tftpboot');
+deploy_module_symlink($amp_conf['AMPWEBROOT'] . '/PhoneSettings', $module_root . '/PhoneSettings');
+
+
+
+// ============================================================================
 // 1. Directory Setup & Permissions
 // ============================================================================
 $tftp_dir = "/tftpboot/";
