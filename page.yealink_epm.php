@@ -37,7 +37,49 @@ if (!file_exists($tftp_dir)) {
 }
 
 // ============================================================================
-// 2. DETECT GLOBAL HTTPS REDIRECT & DETERMINE PROVISIONING PORT / GUI ADDR
+// 2. DETECT SERVER TIMEZONE & YEALINK MAPPING
+// ============================================================================
+
+function getServerTimezone() {
+    if (file_exists('/etc/timezone')) {
+        $tz = trim(file_get_contents('/etc/timezone'));
+        if (!empty($tz)) return $tz;
+    }
+    if (is_link('/etc/localtime')) {
+        $filename = readlink('/etc/localtime');
+        $pos = strpos($filename, 'zoneinfo/');
+        if ($pos !== false) {
+            return substr($filename, $pos + 9);
+        }
+    }
+    return date_default_timezone_get() ?: 'America/Los_Angeles';
+}
+
+$server_tz_identifier = getServerTimezone();
+
+$yealink_tz_mapping = [
+    'America/Adak'           => ['offset' => '-10', 'name' => 'United States-Hawaii-Aleutian'],
+    'Pacific/Honolulu'       => ['offset' => '-10', 'name' => 'United States-Hawaii-Aleutian'],
+    'America/Anchorage'      => ['offset' => '-9',  'name' => 'United States-Alaska Time'],
+    'America/Los_Angeles'    => ['offset' => '-8',  'name' => 'United States-Pacific Time'],
+    'America/Tijuana'        => ['offset' => '-8',  'name' => 'Mexico(Tijuana,Mexicali)'],
+    'America/Vancouver'      => ['offset' => '-8',  'name' => 'Canada(Vancouver,Whitehorse)'],
+    'America/Denver'         => ['offset' => '-7',  'name' => 'United States-Mountain Time'],
+    'America/Phoenix'        => ['offset' => '-7',  'name' => 'United States-MST no DST'],
+    'America/Chicago'        => ['offset' => '-6',  'name' => 'United States-Central Time'],
+    'America/New_York'       => ['offset' => '-5',  'name' => 'United States-Eastern Time'],
+    'America/Halifax'        => ['offset' => '-4',  'name' => 'Canada(Halifax,Saint John)'],
+    'Europe/London'          => ['offset' => '0',   'name' => 'United Kingdom(London)'],
+    'Europe/Paris'           => ['offset' => '+1',  'name' => 'France(Paris)'],
+    'Europe/Berlin'          => ['offset' => '+1',  'name' => 'Germany(Berlin)'],
+    'Asia/Tokyo'             => ['offset' => '+9',  'name' => 'Japan(Tokyo)'],
+    'Australia/Sydney'       => ['offset' => '+10', 'name' => 'Australia(Sydney,Melbourne,Canberra)']
+];
+
+$detected_tz_info = $yealink_tz_mapping[$server_tz_identifier] ?? ['offset' => '-8', 'name' => 'United States-Pacific Time'];
+
+// ============================================================================
+// 3. DETECT GLOBAL HTTPS REDIRECT & DETERMINE PROVISIONING PORT / GUI ADDR
 // ============================================================================
 
 $sysadmin_redirect = false;
@@ -48,13 +90,11 @@ if (function_exists('sysadmin_get_storage_settings')) {
     }
 }
 
-// Extract host from HTTP headers or server environment
 $raw_host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_ADDR'] ?? '';
 if (strpos($raw_host, ':') !== false) {
     $raw_host = explode(':', $raw_host)[0];
 }
 
-// Determine true LAN GUI IP address (bypassing loopback 127.0.0.1 / 127.0.1.1)
 $get_lan_ip = function() use ($raw_host) {
     if (!empty($raw_host) && filter_var($raw_host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && strpos($raw_host, '127.') !== 0) {
         return $raw_host;
@@ -62,8 +102,6 @@ $get_lan_ip = function() use ($raw_host) {
     if (!empty($_SERVER['SERVER_ADDR']) && filter_var($_SERVER['SERVER_ADDR'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && strpos($_SERVER['SERVER_ADDR'], '127.') !== 0) {
         return $_SERVER['SERVER_ADDR'];
     }
-    
-    // Fallback: Query active interface IP via socket connection test
     $sock = @fsockopen('8.8.8.8', 53, $errno, $errstr, 1);
     if ($sock) {
         $sockname = @getsockname($sock, $local_ip, $local_port);
@@ -72,13 +110,11 @@ $get_lan_ip = function() use ($raw_host) {
             return $local_ip;
         }
     }
-    
     return '192.168.1.1';
 };
 
 $detected_host = $get_lan_ip();
 
-// Automatically route to Port 83 if Port 80 enforces HTTPS redirects
 if ($sysadmin_redirect) {
     $default_provision_url = "http://{$detected_host}:83/PhoneSettings/";
     $default_server_target = "{$detected_host}:83";
@@ -88,7 +124,7 @@ if ($sysadmin_redirect) {
 }
 
 // ============================================================================
-// 3. HELPER FUNCTIONS
+// 4. HELPER FUNCTIONS
 // ============================================================================
 
 function getArpTableMap() {
@@ -178,6 +214,9 @@ function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_ta
     $cfg .= "transfer.on_hook_trans_enable = {$formData['transfer_on_hook_trans_enable']}\n";
     $cfg .= "transfer.dsskey_deal_type = {$formData['transfer_dsskey_deal_type']}\n\n";
     $cfg .= "local_time.time_zone = {$formData['timezone']}\n";
+    if (!empty($formData['timezone_name'])) {
+        $cfg .= "local_time.time_zone_name = {$formData['timezone_name']}\n";
+    }
     $cfg .= "local_time.time_format = {$formData['time_format']}\n";
     $cfg .= "local_time.ntp_server1 = {$ntp1_target}\n";
     $cfg .= "local_time.ntp_server2 = {$ntp2_target}\n";
@@ -204,13 +243,14 @@ function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_ta
 }
 
 // ============================================================================
-// 4. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
+// 5. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
 // ============================================================================
 
 $saved_global_server_ip = $default_server_target;
 $saved_global_admin_pass = "22222";
 $saved_global_time_format = "0"; 
-$saved_global_timezone = "-8";
+$saved_global_timezone = $detected_tz_info['offset'];
+$saved_global_timezone_name = $detected_tz_info['name'];
 $saved_global_ntp_server1 = $detected_host;
 $saved_global_ntp_server2 = "pool.ntp.org";
 $saved_global_dialnow_timeout = "4";
@@ -239,6 +279,9 @@ if (file_exists($global_cfg_file)) {
             }
             if (preg_match('/^local_time\.time_zone\s*=\s*([+\-]?\d+)/i', $g_line, $gm)) {
                 $saved_global_timezone = trim($gm[1]);
+            }
+            if (preg_match('/^local_time\.time_zone_name\s*=\s*(.+)$/i', $g_line, $gm)) {
+                $saved_global_timezone_name = trim($gm[1]);
             }
             if (preg_match('/^local_time\.time_format\s*=\s*([01])$/i', $g_line, $gm)) {
                 $saved_global_time_format = trim($gm[1]);
@@ -409,7 +452,7 @@ if (isset($pdo)) {
 ksort($all_extensions);
 
 // ============================================================================
-// 5. AJAX ENDPOINTS (SUBNET SCANNER & DEVICE PROVISIONING)
+// 6. AJAX ENDPOINTS (SUBNET SCANNER & DEVICE PROVISIONING)
 // ============================================================================
 
 if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
@@ -545,7 +588,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
 }
 
 // ============================================================================
-// 6. POST ACTIONS (DELETE HANDLER)
+// 7. POST ACTIONS (DELETE HANDLER)
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) && !empty($_POST['target_filename'])) {
@@ -576,7 +619,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
 }
 
 // ============================================================================
-// 7. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
+// 8. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
 // ============================================================================
 
 $max_linekeys = isset($_POST['linekey_count']) ? (int)$_POST['linekey_count'] : 1;
@@ -592,6 +635,7 @@ $formData = [
     'sip_listen_port' => '5062',
     'voicemail_number' => $default_voicemail_ext,
     'timezone' => $saved_global_timezone,
+    'timezone_name' => $saved_global_timezone_name,
     'time_format' => $saved_global_time_format,
     'ntp_server1' => $saved_global_ntp_server1,
     'ntp_server2' => $saved_global_ntp_server2,
@@ -690,7 +734,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     if (empty($tpl_name)) $tpl_name = "default_template";
     $tpl_filename = $tpl_name . ".template.cfg";
 
-    // Enforce Port 83 and keep /PhoneSettings/ prefix for static asset delivery
     $host_only = explode(':', $server_ip_target)[0];
     $asset_host = "http://{$host_only}:83/PhoneSettings";
 
@@ -779,7 +822,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         }
     }
 
-    // Universal Dual-Ringtone Directives
     if (!empty($ringtone_url)) {
         $generated_template_cfg .= "ringtone.url = {$ringtone_url}\n";
         $generated_template_cfg .= "phone_setting.ringtone = {$formData['ringtone_file']}\n";
@@ -808,7 +850,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
 }
 
 // ============================================================================
-// 8. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
+// 9. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
@@ -819,7 +861,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
     $edited_macs = $_POST['edited_mac'] ?? [];
     $bulk_override_tpl = trim($_POST['bulk_selected_template'] ?? '');
 
-    // Handle MAC edits before performing actions
     foreach ($edited_macs as $orig_mac => $new_mac) {
         $clean_orig = strtolower(trim($orig_mac));
         $clean_new = strtolower(preg_replace('/[^a-fA-F0-9]/', '', $new_mac));
@@ -1058,7 +1099,7 @@ if (is_array($existing_files)) {
         }
 
         if (!empty($ext_num)) {
-            $assigned_extensions_map[$ext_num] = true;
+            $assigned_extensions_map[(string)$ext_num] = true;
         }
 
         $ip_addr = $arp_table[$file_name_no_ext] ?? 'Unknown / Offline';
@@ -1075,7 +1116,6 @@ if (is_array($existing_files)) {
     }
 }
 
-// Build array of unassigned extensions available for scanner/manual entry
 $available_extensions = [];
 foreach ($all_extensions as $e_id => $e_data) {
     if (!isset($assigned_extensions_map[(string)$e_id])) {
@@ -1211,7 +1251,7 @@ if (isset($_POST['load_template']) && !empty($_POST['template_to_load'])) {
 }
 
 // ============================================================================
-// 9. SAVE GLOBAL CONFIGURATION HANDLER
+// 10. SAVE GLOBAL CONFIGURATION HANDLER
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['save_global'])) {
@@ -1237,7 +1277,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 ?>
 
 <!-- ============================================================================ -->
-<!-- 10. HTML VIEW & STYLES                                                       -->
+<!-- 11. HTML VIEW & STYLES                                                       -->
 <!-- ============================================================================ -->
 
 <style>
@@ -1288,7 +1328,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 </style>
 
 <!-- ============================================================================ -->
-<!-- 11. JAVASCRIPT CONTROLLERS & AJAX                                            -->
+<!-- 12. JAVASCRIPT CONTROLLERS & AJAX                                            -->
 <!-- ============================================================================ -->
 
 <script>
@@ -1672,7 +1712,6 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         });
     }
 
-    // Retain active tab state across refreshes / hash state
     document.addEventListener("DOMContentLoaded", function() {
         if (window.location.hash === '#tab_devices' || '<?= $formData['active_tab'] ?>' === 'tab_devices') {
             switchTab('tab_devices');
@@ -1811,7 +1850,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 </div>
 
 <!-- ============================================================================ -->
-<!-- 12. TABBED UI LAYOUT                                                         -->
+<!-- 13. TABBED UI LAYOUT                                                         -->
 <!-- ============================================================================ -->
 
 <div class="gen-container">
@@ -2214,7 +2253,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <input type="hidden" id="single_ext_input" name="single_ext" value="">
             <input type="hidden" id="single_mac_input" name="single_mac" value="">
 
-            <div style="display:flex; justify-space-between; align-items:center;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
                 <h3>Registered Extensions & Devices</h3>
                 <div style="display:flex; gap:10px; align-items:center;">
                     <button type="button" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="openManualAddModal()">+ Manually Add Device</button>
