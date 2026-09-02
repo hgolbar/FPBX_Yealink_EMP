@@ -37,7 +37,34 @@ if (!file_exists($tftp_dir)) {
 }
 
 // ============================================================================
-// 2. HELPER FUNCTIONS
+// 2. DETECT GLOBAL HTTPS REDIRECT & DETERMINE PROVISIONING PORT
+// ============================================================================
+
+$sysadmin_redirect = false;
+if (function_exists('sysadmin_get_storage_settings')) {
+    $settings = sysadmin_get_storage_settings();
+    if (!empty($settings['https_redirect'])) {
+        $sysadmin_redirect = true;
+    }
+}
+
+// Extract base host name or IP address
+$detected_host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_ADDR'] ?? '192.168.1.1';
+if (strpos($detected_host, ':') !== false) {
+    $detected_host = explode(':', $detected_host)[0];
+}
+
+// Automatically route to Port 83 if Port 80 enforces HTTPS redirects
+if ($sysadmin_redirect) {
+    $default_provision_url = "http://{$detected_host}:83/PhoneSettings/";
+    $default_server_target = "{$detected_host}:83";
+} else {
+    $default_provision_url = "http://{$detected_host}/PhoneSettings/";
+    $default_server_target = $detected_host;
+}
+
+// ============================================================================
+// 3. HELPER FUNCTIONS
 // ============================================================================
 
 function sendSipNotify($ext_or_mac, $event_type = 'check-sync') {
@@ -62,16 +89,23 @@ function sendSipNotify($ext_or_mac, $event_type = 'check-sync') {
     return true;
 }
 
-function generateAndSaveGlobalConfig($formData, $cfg_version, $detected_ip, $tftp_dir) {
-    $raw_server = !empty($formData['server_ip']) ? $formData['server_ip'] : $detected_ip;
+function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_target, $tftp_dir) {
+    $raw_server = !empty($formData['server_ip']) ? $formData['server_ip'] : $default_server_target;
     
     if (strpos($raw_server, '://') === false) {
         $raw_server = 'http://' . $raw_server;
     }
+    
     $parsed_host = parse_url($raw_server, PHP_URL_HOST);
-    $server_ip_target = !empty($parsed_host) ? $parsed_host : $detected_ip;
+    $parsed_port = parse_url($raw_server, PHP_URL_PORT);
+    
+    if (!empty($parsed_host)) {
+        $server_ip_target = $parsed_host . (!empty($parsed_port) ? ':' . $parsed_port : '');
+    } else {
+        $server_ip_target = $default_server_target;
+    }
 
-    $ntp1_target = !empty($formData['ntp_server1']) ? $formData['ntp_server1'] : $server_ip_target;
+    $ntp1_target = !empty($formData['ntp_server1']) ? $formData['ntp_server1'] : explode(':', $server_ip_target)[0];
     $ntp2_target = !empty($formData['ntp_server2']) ? $formData['ntp_server2'] : 'pool.ntp.org';
 
     $cfg = "#!version:{$cfg_version}\n\n";
@@ -120,19 +154,14 @@ function generateAndSaveGlobalConfig($formData, $cfg_version, $detected_ip, $tft
 }
 
 // ============================================================================
-// 3. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
+// 4. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
 // ============================================================================
 
-$detected_ip = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_ADDR'] ?? '192.168.1.1';
-if (strpos($detected_ip, ':') !== false) {
-    $detected_ip = explode(':', $detected_ip)[0];
-}
-
-$saved_global_server_ip = $detected_ip;
+$saved_global_server_ip = $default_server_target;
 $saved_global_admin_pass = "22222";
 $saved_global_time_format = "0"; 
 $saved_global_timezone = "-8";
-$saved_global_ntp_server1 = $detected_ip;
+$saved_global_ntp_server1 = $detected_host;
 $saved_global_ntp_server2 = "pool.ntp.org";
 $saved_global_dialnow_timeout = "4";
 $file_dialnow_patterns = [];
@@ -153,11 +182,7 @@ if (file_exists($global_cfg_file)) {
             }
             if (preg_match('/^auto_provision\.server\.url\s*=\s*http:\/\/(.+)$/i', $g_line, $gm)) {
                 $raw_parsed = trim($gm[1]);
-                if (strpos($raw_parsed, '://') === false) {
-                    $raw_parsed = 'http://' . $raw_parsed;
-                }
-                $host_only = parse_url($raw_parsed, PHP_URL_HOST);
-                $saved_global_server_ip = !empty($host_only) ? $host_only : $raw_parsed;
+                $saved_global_server_ip = $raw_parsed;
             }
             if (preg_match('/^security\.user_password\s*=\s*admin:(.+)$/i', $g_line, $gm)) {
                 $saved_global_admin_pass = trim($gm[1]);
@@ -184,8 +209,9 @@ if (file_exists($global_cfg_file)) {
         }
     }
 }
+
 if (empty($saved_global_ntp_server1)) {
-    $saved_global_ntp_server1 = $saved_global_server_ip;
+    $saved_global_ntp_server1 = $detected_host;
 }
 
 $all_extensions = [];
@@ -333,7 +359,7 @@ if (isset($pdo)) {
 ksort($all_extensions);
 
 // ============================================================================
-// 4. AJAX ENDPOINTS (SUBNET SCANNER & DEVICE PROVISIONING)
+// 5. AJAX ENDPOINTS (SUBNET SCANNER & DEVICE PROVISIONING)
 // ============================================================================
 
 if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
@@ -356,7 +382,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_network') {
     if (preg_match('/^(\d{1,3}\.\d{1,3}\.\d{1,3})/', $subnet_input, $m)) {
         $prefix = $m[1];
     } else {
-        $prefix = implode('.', array_slice(explode('.', $_SERVER['SERVER_ADDR'] ?? '192.168.1.1'), 0, 3));
+        $prefix = implode('.', array_slice(explode('.', $detected_host), 0, 3));
     }
 
     exec("ping -c 2 -b {$prefix}.255 > /dev/null 2>&1 &");
@@ -469,7 +495,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
 }
 
 // ============================================================================
-// 5. POST ACTIONS (DELETE HANDLER)
+// 6. POST ACTIONS (DELETE HANDLER)
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) && !empty($_POST['target_filename'])) {
@@ -500,7 +526,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
 }
 
 // ============================================================================
-// 6. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
+// 7. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
 // ============================================================================
 
 $max_linekeys = isset($_POST['linekey_count']) ? (int)$_POST['linekey_count'] : 1;
@@ -570,7 +596,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     }
 
     if (!file_exists($tftp_dir . "y000000000000.cfg")) {
-        generateAndSaveGlobalConfig($formData, $cfg_version, $detected_ip, $tftp_dir);
+        generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_target, $tftp_dir);
     }
 
     if (isset($_FILES['ringtone_upload']) && $_FILES['ringtone_upload']['error'] === UPLOAD_ERR_OK) {
@@ -614,7 +640,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     if (empty($tpl_name)) $tpl_name = "default_template";
     $tpl_filename = $tpl_name . ".template.cfg";
 
-    $ringtone_url = !empty($formData['ringtone_file']) ? "http://{$server_ip_target}/PhoneSettings/ringtones/" . $formData['ringtone_file'] : "";
+    // Enforce Port 83 and keep /PhoneSettings/ prefix for static asset delivery
+    $host_only = explode(':', $server_ip_target)[0];
+    $asset_host = "http://{$host_only}:83/PhoneSettings";
+
+    $ringtone_url = !empty($formData['ringtone_file']) ? "{$asset_host}/ringtones/" . $formData['ringtone_file'] : "";
+    $logo_path_prefix = "{$asset_host}/logo/";
     
     $logo_url = "";
     $lcd_logo_mode = "0";
@@ -626,7 +657,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         $logo_url = "Config:default";
     } elseif (!empty($formData['logo_file'])) {
         $lcd_logo_mode = "2";
-        $logo_url = "http://{$server_ip_target}/PhoneSettings/logo/" . $formData['logo_file'];
+        $logo_url = $logo_path_prefix . $formData['logo_file'];
         
         $ext = strtolower(pathinfo($formData['logo_file'], PATHINFO_EXTENSION));
         if ($formData['phone_model'] === 'T28P' || $ext === 'dob') {
@@ -693,8 +724,10 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         }
     }
 
+    // Universal Dual-Ringtone Directives
     if (!empty($ringtone_url)) {
-        $generated_template_cfg .= "phone_setting.ringtone = {$ringtone_url}\n";
+        $generated_template_cfg .= "ringtone.url = {$ringtone_url}\n";
+        $generated_template_cfg .= "phone_setting.ringtone = {$formData['ringtone_file']}\n";
     }
     
     $generated_template_cfg .= "phone_setting.lcd_logo.mode = {$lcd_logo_mode}\n";
@@ -720,7 +753,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
 }
 
 // ============================================================================
-// 7. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
+// 8. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
@@ -728,6 +761,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
     $selected_macs = $_POST['selected_phones'] ?? [];
     $assigned_tpls = $_POST['phone_template'] ?? [];
     $assigned_exts = $_POST['phone_extension'] ?? [];
+    $bulk_override_tpl = trim($_POST['bulk_selected_template'] ?? '');
 
     if ($action === 'delete_selected') {
         $deleted_count = 0;
@@ -785,7 +819,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
         foreach ($targets as $smac) {
             $clean_mac = strtolower(trim($smac));
             $f_path = $tftp_dir . $clean_mac . ".cfg";
-            $new_tpl = $assigned_tpls[$clean_mac] ?? ($assigned_tpls[strtoupper($clean_mac)] ?? '');
+            
+            if ($action === 'rebuild_selected' && !empty($bulk_override_tpl)) {
+                $new_tpl = $bulk_override_tpl;
+            } else {
+                $new_tpl = $assigned_tpls[$clean_mac] ?? ($assigned_tpls[strtoupper($clean_mac)] ?? '');
+            }
+            
             $new_ext = $assigned_exts[$clean_mac] ?? ($assigned_exts[strtoupper($clean_mac)] ?? '');
 
             if (file_exists($f_path)) {
@@ -1040,8 +1080,9 @@ if (isset($_POST['load_template']) && !empty($_POST['template_to_load'])) {
             if ($k === 'account.1.sip_listen_port') { $formData['sip_listen_port'] = $v; $is_parsed_tpl = true; }
             if ($k === 'voice_mail.number.1') { $formData['voicemail_number'] = $v; $is_parsed_tpl = true; }
             if ($k === 'account.1.ringtone.ring_type') { $formData['ringtone_file'] = $v; $is_parsed_tpl = true; }
-            if ($k === 'ringtone.url' || $k === 'phone_setting.ringtone') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
+            if ($k === 'ringtone.url') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
             if ($k === 'phone_setting.lcd_logo.mode') { $is_parsed_tpl = true; }
+	     if ($k === 'phone_setting.ringtone') { $formData['ringtone_file'] = basename($v); $is_parsed_tpl = true; }
             if ($k === 'lcd_logo.url' || $k === 'phone_setting.background_image') { 
                 if (empty($v) || $v === 'Config:default') {
                     $formData['logo_file'] = '';
@@ -1083,7 +1124,7 @@ if (isset($_POST['load_template']) && !empty($_POST['template_to_load'])) {
 }
 
 // ============================================================================
-// 8. SAVE GLOBAL CONFIGURATION HANDLER
+// 9. SAVE GLOBAL CONFIGURATION HANDLER
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['save_global'])) {
@@ -1097,7 +1138,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['save_global'])) {
         if (isset($_POST[$k])) $formData[$k] = trim($_POST[$k]);
     }
 
-    $generated_common_cfg = generateAndSaveGlobalConfig($formData, $cfg_version, $detected_ip, $tftp_dir);
+    $generated_common_cfg = generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_target, $tftp_dir);
     $status = "Saved y000000000000.cfg to {$tftp_dir}";
 }
 
@@ -1109,7 +1150,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 ?>
 
 <!-- ============================================================================ -->
-<!-- 9. HTML VIEW & STYLES                                                        -->
+<!-- 10. HTML VIEW & STYLES                                                       -->
 <!-- ============================================================================ -->
 
 <style>
@@ -1160,7 +1201,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 </style>
 
 <!-- ============================================================================ -->
-<!-- 10. JAVASCRIPT CONTROLLERS & AJAX                                            -->
+<!-- 11. JAVASCRIPT CONTROLLERS & AJAX                                            -->
 <!-- ============================================================================ -->
 
 <script>
@@ -1511,7 +1552,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         <h3>Subnet MAC Address Scanner (Yealink)</h3>
         <label>Enter Subnet Base IP (e.g., 192.168.X.X):</label>
         <div style="display:flex; gap:10px;">
-            <input type="text" id="scan_subnet" class="gen-full-width" value="<?= $detected_ip ?>">
+            <input type="text" id="scan_subnet" class="gen-full-width" value="<?= $detected_host ?>">
             <button type="button" class="gen-btn" style="margin-top:0;" onclick="runSubnetScan()">Scan Subnet</button>
         </div>
         
@@ -1566,7 +1607,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
         </div>
 
         <br>
-        <div style="display:flex; justify-space-between; gap:10px;">
+        <div style="display:flex; justify-content:space-between; gap:10px;">
             <button type="button" id="manual_add_btn" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="submitManualAddDevice()">Create Device Config</button>
             <button type="button" class="gen-btn-danger" style="margin-top:0;" onclick="closeManualAddModal()">Cancel / Close</button>
         </div>
@@ -1612,11 +1653,20 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
 </div>
 
 <!-- ============================================================================ -->
-<!-- 11. TABBED UI LAYOUT                                                         -->
+<!-- 12. TABBED UI LAYOUT                                                         -->
 <!-- ============================================================================ -->
 
 <div class="gen-container">
     <h2>Yealink Endpoint Manager</h2>
+    
+    <?php if ($sysadmin_redirect): ?>
+        <div class="alert alert-warning alert-dismissible" role="alert" style="margin-top: 15px;">
+            <button type="button" class="close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+            <strong>Notice for Legacy Yealink Phones:</strong> Global HTTPS Redirect is active in System Admin. 
+            Provisioning URLs have been automatically routed to <strong>Port 83</strong> (<code><?= htmlspecialchars($default_provision_url) ?></code>) to ensure legacy V73 firmware can provision over HTTP without SSL errors.
+        </div>
+    <?php endif; ?>
+
     <?php if (!empty($status)) echo "<div class='gen-alert'>{$status}</div>"; ?>
 
     <div class="gen-tab-bar">
@@ -1634,7 +1684,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <div class="gen-key-row">
                 <div>
                     <label>PBX Server IP / Domain:</label>
-                    <input type="text" class="gen-full-width" name="server_ip" placeholder="<?= $detected_ip ?>" value="<?= htmlspecialchars($formData['server_ip']) ?>">
+                    <input type="text" class="gen-full-width" name="server_ip" placeholder="<?= $default_server_target ?>" value="<?= htmlspecialchars($formData['server_ip']) ?>">
                 </div>
                 <div>
                     <label>Phone Web GUI Admin Password:</label>
@@ -1663,7 +1713,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <div class="gen-key-row">
                 <div>
                     <label>NTP Server 1:</label>
-                    <input type="text" class="gen-full-width" name="ntp_server1" placeholder="<?= $detected_ip ?>" value="<?= htmlspecialchars($formData['ntp_server1']) ?>">
+                    <input type="text" class="gen-full-width" name="ntp_server1" placeholder="<?= $detected_host ?>" value="<?= htmlspecialchars($formData['ntp_server1']) ?>">
                 </div>
                 <div>
                     <label>NTP Server 2:</label>
@@ -2006,7 +2056,7 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
             <input type="hidden" id="single_ext_input" name="single_ext" value="">
             <input type="hidden" id="single_mac_input" name="single_mac" value="">
 
-            <div style="display:flex; justify-space-between; align-items:center;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
                 <h3>Registered Extensions & Devices</h3>
                 <div style="display:flex; gap:10px;">
                     <button type="button" class="gen-btn" style="margin-top:0; background:#28a745;" onclick="openManualAddModal()">+ Manually Add Device</button>
@@ -2076,10 +2126,17 @@ $ringtone_filenames = array_map('basename', is_array($existing_ringtones) ? $exi
                     <button type="button" class="gen-btn-danger" style="margin:0;" onclick="triggerDeviceAction('delete_selected')">Delete</button>
                     <span>Delete Selected Phones</span>
                 </div>
-                <div class="oss-action-line">
-                    <button type="button" class="gen-btn" style="margin:0; background:#28a745;" onclick="triggerDeviceAction('rebuild_selected')">Rebuild</button>
+                <div class="oss-action-line" style="flex-wrap: wrap; gap: 10px;">
+                    <button type="button" class="gen-btn" style="margin:0; background:#28a745;" onclick="triggerDeviceAction('rebuild_selected')">Rebuild Selected</button>
+                    
+                    <select name="bulk_selected_template" style="padding: 6px; border-radius: 4px; border: 1px solid #ccc;">
+                        <option value="">-- Use Assigned Individual Templates --</option>
+                        <?php foreach ($available_templates as $tpl_file => $tpl_label): ?>
+                            <option value="<?= htmlspecialchars($tpl_file) ?>"><?= htmlspecialchars($tpl_label) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+
                     <span>
-                        Rebuild Configs for Selected Phones 
                         (<label style="display:inline; font-weight:normal;"><input type="checkbox" name="auto_provision_selected" checked> Push Auto Provision</label>)
                         (<label style="display:inline; font-weight:normal;"><input type="checkbox" name="reboot_selected"> Reboot Phones</label>)
                     </span>
