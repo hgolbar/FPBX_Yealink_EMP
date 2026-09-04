@@ -1,4 +1,8 @@
 <?php
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
 if (!defined('FREEPBX_IS_AUTH')) { die('No direct script access allowed'); }
 
 ini_set('display_errors', 0);
@@ -23,6 +27,8 @@ $status = "";
 $tftp_dir = "/tftpboot/";
 $logo_dir = "/var/www/html/PhoneSettings/logo/";
 $ringtone_dir = "/var/www/html/PhoneSettings/ringtones/";
+$ringtone_was_deleted = false;
+$just_flushed = false;
 
 foreach ([$logo_dir, $ringtone_dir] as $dir) {
     if (!file_exists($dir)) {
@@ -171,9 +177,12 @@ function sendSipNotify($ext_or_mac, $event_type = 'check-sync', $phone_ip = '', 
     $ext = preg_replace('/[^0-9]/', '', $ext_or_mac);
     if (empty($ext)) return false;
 
-    $notify_type = ($event_type === 'reboot') ? 'reboot-yealink' : 'check-sync';
-
-    exec("asterisk -rx 'pjsip send notify {$notify_type} endpoint {$ext}' 2>&1");
+    if ($event_type === 'reboot') {
+        exec("asterisk -rx 'pjsip send notify reboot-yealink endpoint {$ext}' 2>&1 &");
+    } else {
+        exec("asterisk -rx 'pjsip send notify check-sync endpoint {$ext}' 2>&1 &");
+        exec("asterisk -rx 'pjsip send notify yealink-check-cfg endpoint {$ext}' 2>&1 &");
+    }
 
     $contacts_output = [];
     exec("asterisk -rx 'pjsip show contacts' 2>&1", $contacts_output);
@@ -181,18 +190,18 @@ function sendSipNotify($ext_or_mac, $event_type = 'check-sync', $phone_ip = '', 
         foreach ($contacts_output as $line) {
             if (preg_match('/Contact:\s*(' . preg_quote($ext, '/') . '\/sip:[^\s]+)/i', $line, $cm)) {
                 $contact_uri = trim($cm[1]);
-                exec("asterisk -rx 'pjsip send notify {$notify_type} contact {$contact_uri}' 2>&1");
+                $notify_type = ($event_type === 'reboot') ? 'reboot-yealink' : 'check-sync';
+                exec("asterisk -rx 'pjsip send notify {$notify_type} contact {$contact_uri}' 2>&1 &");
             }
         }
     }
 
     if (!empty($phone_ip) && filter_var($phone_ip, FILTER_VALIDATE_IP)) {
-        usleep(500000);
         $ch = curl_init("http://{$phone_ip}/servlet?p=settings-ring&q=load");
         curl_setopt($ch, CURLOPT_USERPWD, "admin:{$admin_pass}");
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 2);
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+        curl_setopt($ch, CURLOPT_TIMEOUT_MS, 300);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, 300);
         @curl_exec($ch);
         @curl_close($ch);
     }
@@ -203,11 +212,7 @@ function sendSipNotify($ext_or_mac, $event_type = 'check-sync', $phone_ip = '', 
 function buildDistinctiveRingtoneConfigBlock() {
     $ringtone_dir = "/var/www/html/PhoneSettings/ringtones/";
     $existing_ringtones = glob($ringtone_dir . "*.*");
-    $ring_files = array_map('basename', is_array($existing_ringtones) ? $existing_ringtones : []);
-
-    if (empty($ring_files)) {
-        return "";
-    }
+    $ring_files = array_values(array_map('basename', is_array($existing_ringtones) ? $existing_ringtones : []));
 
     $cfg = "######## DISTINCTIVE RINGTONE & ALERT INFO SETUP ########\n";
     $cfg .= "features.alert_info_tone = 1\n";
@@ -215,22 +220,115 @@ function buildDistinctiveRingtoneConfigBlock() {
     $cfg .= "distinctive_ring_tones.alert_info.enable = 1\n\n";
     
     $legacy_index = 8;
-    $r_idx = 1;
+    $total_slots = 10;
 
-    foreach ($ring_files as $r_file) {
-        $text_name = pathinfo($r_file, PATHINFO_FILENAME);
-        
-        $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.text = {$text_name}\n";
-        $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.ringer = {$legacy_index}\n";
-        
-        $cfg .= "account.1.alert_info_text.{$r_idx} = {$text_name}\n";
-        $cfg .= "account.1.alert_info_ringer.{$r_idx} = {$r_file}\n";
-
-        $r_idx++;
-        $legacy_index++;
+    for ($r_idx = 1; $r_idx <= $total_slots; $r_idx++) {
+        if (isset($ring_files[$r_idx - 1])) {
+            $r_file = $ring_files[$r_idx - 1];
+            $text_name = pathinfo($r_file, PATHINFO_FILENAME);
+            
+            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.text = {$text_name}\n";
+            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.ringer = {$legacy_index}\n";
+            $cfg .= "account.1.alert_info_text.{$r_idx} = {$text_name}\n";
+            $cfg .= "account.1.alert_info_ringer.{$r_idx} = {$r_file}\n";
+            $legacy_index++;
+        } else {
+            // Explicitly force %NULL% to wipe unused/cleared slots in NVRAM
+            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.text = %NULL%\n";
+            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.ringer = %NULL%\n";
+            $cfg .= "account.1.alert_info_text.{$r_idx} = %NULL%\n";
+            $cfg .= "account.1.alert_info_ringer.{$r_idx} = %NULL%\n";
+        }
     }
     $cfg .= "######## END DISTINCTIVE RINGTONE SETUP ########\n\n";
     return $cfg;
+}
+
+function rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, $append_flush = false) {
+    if (empty($tpl_filename) || !file_exists($tftp_dir . $tpl_filename)) {
+        return 0;
+    }
+
+    $arp_table = getArpTableMap();
+    $all_cfg_files = glob($tftp_dir . "*.cfg");
+    $updated_count = 0;
+
+    if (is_array($all_cfg_files)) {
+        foreach ($all_cfg_files as $cf) {
+            $mname = strtolower(pathinfo($cf, PATHINFO_FILENAME));
+            if ($mname === 'y000000000000' || strpos(strtolower($cf), 'template') !== false) {
+                continue;
+            }
+
+            $c_lines = @file($cf, FILE_IGNORE_NEW_LINES);
+            $uses_tpl = false;
+            $assigned_ext = '';
+
+            if ($c_lines) {
+                foreach ($c_lines as $cl) {
+                    if (preg_match('/^#\s*Template\s*:\s*(.+)$/i', $cl, $tm)) {
+                        if (strcasecmp(trim($tm[1]), $tpl_filename) === 0) {
+                            $uses_tpl = true;
+                        }
+                    }
+                    if (preg_match('/^account\.1\.(auth_name|user_name)\s*=\s*(.+)$/i', $cl, $em)) {
+                        $assigned_ext = trim($em[2]);
+                    }
+                }
+            }
+
+            if ($uses_tpl) {
+                $file_content = file_get_contents($cf);
+                
+                if (($pos = strpos($file_content, '##### INHERITED TEMPLATE SETTINGS')) !== false) {
+                    $base_content = substr($file_content, 0, $pos);
+                } else {
+                    $base_content = $file_content;
+                }
+
+                if (($pos_flush = strpos($base_content, '######## ONE-TIME RINGTONE FLASH CLEAR ########')) !== false) {
+                    $base_content = substr($base_content, 0, $pos_flush);
+                }
+
+                $tpl_content = file_get_contents($tftp_dir . $tpl_filename);
+                $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
+                $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
+
+                if ($append_flush) {
+                    // Strip the active distinctive block so it doesn't immediately overwrite the flush
+                    $tpl_content = preg_replace('/######## DISTINCTIVE RINGTONE & ALERT INFO SETUP ########.*?######## END DISTINCTIVE RINGTONE SETUP ########/s', '', $tpl_content);
+
+                    $flush_block = "######## ONE-TIME RINGTONE FLASH CLEAR ########\n";
+                    $flush_block .= "ringtone.delete = http://localhost/all\n";
+                    for ($clear_i = 1; $clear_i <= 10; $clear_i++) {
+                        $flush_block .= "distinctive_ring_tones.alert_info.{$clear_i}.text = %NULL%\n";
+                        $flush_block .= "distinctive_ring_tones.alert_info.{$clear_i}.ringer = %NULL%\n";
+                        $flush_block .= "account.1.alert_info_text.{$clear_i} = %NULL%\n";
+                        $flush_block .= "account.1.alert_info_ringer.{$clear_i} = %NULL%\n";
+                    }
+                    $flush_block .= "\n";
+
+                    if (preg_match('/^account\.1\.ringtone\.ring_type\s*=/m', $tpl_content)) {
+                        $tpl_content = preg_replace('/^(account\.1\.ringtone\.ring_type\s*=)/m', $flush_block . '$1', $tpl_content, 1);
+                    } else {
+                        $tpl_content = $flush_block . $tpl_content;
+                    }
+                }
+                
+                $final_cfg = rtrim($base_content) . "\n\n##### INHERITED TEMPLATE SETTINGS ({$tpl_filename}) #####\n" . $tpl_content;
+
+                @file_put_contents($cf, $final_cfg);
+                @chown($cf, 'asterisk');
+
+                if (!empty($assigned_ext)) {
+                    $target_ip = $arp_table[$mname] ?? '';
+                    sendSipNotify($assigned_ext, 'check-sync', $target_ip, $saved_global_admin_pass);
+                }
+                $updated_count++;
+            }
+        }
+    }
+    return $updated_count;
 }
 
 function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_target, $tftp_dir) {
@@ -273,7 +371,8 @@ function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_ta
     $cfg = "#!version:{$cfg_version}\n\n";
     $cfg .= "##File header \"#!version:{$cfg_version}\" can not be edited or deleted.##\n\n";
     $cfg .= "security.user_password = admin:{$admin_pass}\n\n";
-    $cfg .= "sip.notify_reboot_enable = 0\n";
+    $cfg .= "sip.notify_reboot_enable = 1\n";
+    $cfg .= "phone_setting.zero_touch_enable = 1\n";
     $cfg .= "action_uri.enable = 1\n";
     $cfg .= "features.action_uri_limit_ip = any\n\n";
     $cfg .= "auto_provision.mode = {$auto_prov_mode}\n";
@@ -705,7 +804,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
 }
 
 // ============================================================================
-// 7. POST ACTIONS (DELETE HANDLER)
+// 7. POST ACTIONS (DELETE HANDLER & TEMPLATE FLUSH HANDLER)
 // ============================================================================
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) && !empty($_POST['target_filename'])) {
@@ -731,6 +830,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
     if (!empty($full_path) && file_exists($full_path) && is_file($full_path)) {
         if (@unlink($full_path)) {
             $status = "Successfully deleted file: " . htmlspecialchars($target_file);
+            if ($file_type === 'ringtone') {
+                $ringtone_was_deleted = true;
+            }
         }
     }
 
@@ -740,6 +842,24 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
             $curr_tpl .= '.template.cfg';
         }
         $_POST['template_to_load'] = $curr_tpl;
+    }
+}
+
+// Handle Template Specific Flush Ringtones Request
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_ringtones'])) {
+    $target_tpl = trim($_POST['template_name'] ?? '');
+    if (!empty($target_tpl)) {
+        if (strpos($target_tpl, '.template.cfg') === false && strpos($target_tpl, '.cfg') === false) {
+            $tpl_filename = $target_tpl . '.template.cfg';
+        } else {
+            $tpl_filename = $target_tpl;
+        }
+
+        $flushed_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, true);
+        $_SESSION['pending_ringtone_flush'][$tpl_filename] = true;
+        $status = "Pushed ringtone flush directive (ringtone.delete = http://localhost/all) and cleared internal ringer text for {$flushed_count} device(s) using template '{$tpl_filename}'.";
+        $_POST['template_to_load'] = $tpl_filename;
+        $just_flushed = true;
     }
 }
 
@@ -963,7 +1083,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
 
     @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
     @chown($tftp_dir . $tpl_filename, 'asterisk');
-    $status = "Saved Template: {$tpl_filename} to {$tftp_dir}";
+
+    if (!empty($_SESSION['pending_ringtone_flush'][$tpl_filename])) {
+        $rebuilt_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, false);
+        unset($_SESSION['pending_ringtone_flush'][$tpl_filename]);
+        $status = "Saved Template '{$tpl_filename}' and automatically rebuilt & pushed configurations to {$rebuilt_count} assigned device(s).";
+    } else {
+        $status = "Saved Template: {$tpl_filename} to /tftpboot/. Device CFG files were not modified.";
+    }
 
     $_POST['template_to_load'] = $tpl_filename;
 }
@@ -971,6 +1098,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
 // ============================================================================
 // 9. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
 // ============================================================================
+
+$show_flush_ringtone_btn = $ringtone_was_deleted;
 
 if (isset($_POST['load_template']) || !empty($_POST['template_to_load'])) {
     $tpl_filename = basename($_POST['template_to_load'] ?? '');
@@ -1304,6 +1433,35 @@ if (empty($formData['uploaded_ringtones'])) {
     $formData['uploaded_ringtones'] = $ringtone_filenames;
 }
 
+// Scan device mac.cfg files for references to ringtones no longer in /ringtones/
+if (!$just_flushed && !empty($formData['template_name'])) {
+    $active_tpl_file = strpos($formData['template_name'], '.template.cfg') === false ? $formData['template_name'] . '.template.cfg' : $formData['template_name'];
+    $mac_files = glob($tftp_dir . "*.cfg");
+    
+    if (is_array($mac_files)) {
+        foreach ($mac_files as $mf) {
+            $m_base = strtolower(pathinfo($mf, PATHINFO_FILENAME));
+            if ($m_base === 'y000000000000' || strpos(strtolower($mf), 'template') !== false) {
+                continue;
+            }
+
+            $m_content = file_get_contents($mf);
+            if (preg_match('/#\s*Template\s*:\s*' . preg_quote($active_tpl_file, '/') . '/i', $m_content)) {
+                if (preg_match_all('/ringtone\.url\s*=\s*http:\/\/[^\/]+\/PhoneSettings\/ringtones\/([^\s]+)/i', $m_content, $rmatches)) {
+                    foreach ($rmatches[1] as $referenced_ring) {
+                        if (!in_array($referenced_ring, $ringtone_filenames)) {
+                            $show_flush_ringtone_btn = true;
+                            break 2;
+                        }
+                    }
+                }
+            }
+        }
+    }
+} else if ($just_flushed) {
+    $show_flush_ringtone_btn = false;
+}
+
 $existing_files = glob($tftp_dir . "*.cfg");
 $available_templates = [];
 $managed_devices = [];
@@ -1461,53 +1619,62 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         padding-bottom: 5px; 
     }
 
-/* Template Loader Box (Extended to line up with Device Manager tab edge) */
-.gen-load-box { 
-    background: #f8f9fa; 
-    padding: 10px 14px; 
-    border-radius: 6px; 
-    margin-bottom: 20px;
-    position: sticky;
-    top: 92px; 
-    z-index: 99;
-    border: 1px solid #ced4da;
-    display: block;
-    width: 730px; /* Aligns precisely with the right edge of Device Manager tab */
-    box-sizing: border-box;
-}
+    /* Sticky Active Template Banner Extended Width */
+    .gen-load-box { 
+        background: #f8f9fa; 
+        padding: 10px 14px; 
+        border-radius: 6px; 
+        margin-bottom: 20px;
+        position: sticky;
+        top: 92px; 
+        z-index: 99;
+        border: 1px solid #ced4da;
+        display: block;
+        width: 730px;
+        box-sizing: border-box;
+    }
 
-.gen-load-box label {
-    font-size: 13px;
-    font-weight: bold;
-    margin-top: 0 !important;
-    margin-bottom: 6px;
-    color: #333;
-}
+    .gen-load-box label {
+        font-size: 13px;
+        font-weight: bold;
+        margin-top: 0 !important;
+        margin-bottom: 6px;
+        color: #333;
+    }
 
-/* Force sans-serif font across select box and opened dropdown options */
-.gen-load-box select {
-    padding: 8px !important;
-    height: 36px !important;
-    font-size: 14px !important;
-    font-weight: bold !important;
-    font-family: Arial, Helvetica, sans-serif !important;
-    color: #4d4d4d !important;
-    border: 1px solid #ccc !important;
-    border-radius: 4px !important;
-    background-color: #fff !important;
-    flex: 1 1 auto;
-}
+    /* Active / Edit Template Select Styling & Dropdown Sans-Serif Overrides */
+    .gen-load-box select {
+        padding: 8px !important;
+        height: 36px !important;
+        font-size: 14px !important;
+        font-weight: bold !important;
+        font-family: Arial, Helvetica, sans-serif !important;
+        color: #4d4d4d !important;
+        border: 1px solid #ccc !important;
+        border-radius: 4px !important;
+        background-color: #fff !important;
+        flex: 1 1 auto;
+    }
 
-/* Explicit option popup styling to stop OS serif fallback */
-.gen-load-box select option,
-.gen-load-box select optgroup,
-#select_template_file option {
-    font-family: Arial, Helvetica, sans-serif !important;
-    font-size: 14px !important;
-    font-weight: normal !important;
-    color: #333 !important;
-    background-color: #fff !important;
-}
+    .gen-load-box select option,
+    .gen-load-box select optgroup,
+    #select_template_file option {
+        font-family: Arial, Helvetica, sans-serif !important;
+        font-size: 14px !important;
+        font-weight: normal !important;
+        color: #333 !important;
+        background-color: #fff !important;
+    }
+
+    .gen-load-box .gen-btn, 
+    .gen-load-box .gen-btn-danger {
+        padding: 8px 14px !important;
+        height: auto !important;
+        font-size: 13px !important;
+        font-weight: bold !important;
+        margin-top: 0 !important;
+    }
+
     /* Scroll Offset Anchor */
     #ringtone_section {
         scroll-margin-top: 120px;
@@ -1581,9 +1748,9 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         stroke: currentColor;
     }
     
-    .upload-controls-row {
+    .upload-controls-col {
         display: flex !important;
-        flex-direction: row !important;
+        flex-direction: column !important;
         align-items: flex-start !important;
         gap: 8px !important;
         margin-top: 5px !important;
@@ -1640,6 +1807,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
     
     .spec-note { background: #e7f3fe; border-left: 4px solid #2196F3; padding: 8px 12px; font-size: 12px; margin-top: 5px; border-radius: 2px; color: #0c5460; }
     .warning-box { background: #f8d7da; border-left: 4px solid #dc3545; padding: 10px 14px; font-size: 13px; margin-top: 10px; border-radius: 2px; color: #721c24; font-weight: bold; }
+    .flush-banner { background: #fff3cd; border: 1px solid #ffeeba; border-left: 4px solid #ffc107; padding: 12px; margin-bottom: 15px; border-radius: 4px; color: #856404; }
 </style>
 
 <!-- ============================================================================ -->
@@ -2799,6 +2967,19 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             <div id="ringtone_section"></div>
             <h3 class="gen-section-title">Ringtone Management & Provisioning</h3>
 
+            <?php if ($show_flush_ringtone_btn && !empty($formData['template_name'])): ?>
+                <div class="flush-banner">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <strong>&#9888; Missing Ringtone(s) Detected in Phone Configs:</strong> One or more device <code>[mac].cfg</code> files assigned to this template reference ringtones that have been deleted from the server. Click below to issue a flush directive and sync all affected phones.
+                        </div>
+                        <button type="submit" name="flush_template_ringtones" class="gen-btn-danger" style="margin:0; white-space:nowrap; padding:8px 14px; font-weight:bold;">
+                            Flush Ringtones From Phones
+                        </button>
+                    </div>
+                </div>
+            <?php endif; ?>
+
             <div class="ringtone-card">
                 <label style="margin-top:0;">1. Provision Uploaded Sound Files to Phone:</label>
                 <div id="ringtone_spec_note" class="spec-note">Loading specs...</div>
@@ -2850,16 +3031,16 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                 <div style="margin-top:15px; border-top:1px solid #e0e0e0; padding-top:10px;">
                     <label style="margin-top:0; margin-bottom:8px;">Upload New Ringtones:</label>
                     
-                    <div class="upload-controls-row">
-                        <!-- Async Upload Button -->
-                        <button type="button" id="async_upload_btn" onclick="uploadRingtonesAsync(event)" class="upload-btn-aligned">
-                            Upload Ringtones
-                        </button>
-
+                    <div class="upload-controls-col">
                         <!-- Browse Button -->
                         <label for="ringtone_file_input" class="custom-file-btn">Browse Files</label>
                         <input type="file" id="ringtone_file_input" accept=".wav,.mp3" multiple style="display:none;" onchange="updateVerticalFileList(this)">
                         
+                        <!-- Async Upload Button (Positioned Directly Underneath Browse) -->
+                        <button type="button" id="async_upload_btn" onclick="uploadRingtonesAsync(event)" class="upload-btn-aligned">
+                            Upload Ringtones
+                        </button>
+
                         <!-- Multi-line Selected Files Display -->
                         <textarea id="selected_files_textarea" readonly placeholder="No files selected"></textarea>
                     </div>
