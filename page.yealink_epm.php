@@ -124,9 +124,11 @@ $detected_host = $get_lan_ip();
 if ($sysadmin_redirect) {
     $default_provision_url = "http://{$detected_host}:83/PhoneSettings/";
     $default_server_target = "{$detected_host}:83";
+    $ringtone_http_base = "http://{$detected_host}:83/PhoneSettings/ringtones/";
 } else {
     $default_provision_url = "http://{$detected_host}/PhoneSettings/";
     $default_server_target = $detected_host;
+    $ringtone_http_base = "http://{$detected_host}/PhoneSettings/ringtones/";
 }
 
 $builtin_ringtones = [
@@ -209,10 +211,12 @@ function sendSipNotify($ext_or_mac, $event_type = 'check-sync', $phone_ip = '', 
     return true;
 }
 
-function buildDistinctiveRingtoneConfigBlock() {
-    $ringtone_dir = "/var/www/html/PhoneSettings/ringtones/";
-    $existing_ringtones = glob($ringtone_dir . "*.*");
-    $ring_files = array_values(array_map('basename', is_array($existing_ringtones) ? $existing_ringtones : []));
+function buildDistinctiveRingtoneConfigBlock($active_ringtones = []) {
+    if (empty($active_ringtones) || !is_array($active_ringtones)) {
+        return "";
+    }
+
+    $ring_files = array_values($active_ringtones);
 
     $cfg = "######## DISTINCTIVE RINGTONE & ALERT INFO SETUP ########\n";
     $cfg .= "features.alert_info_tone = 1\n";
@@ -868,9 +872,48 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_rington
             $tpl_filename = $target_tpl;
         }
 
+        // 1. Capture current checked ringtones from POST to maintain form state
+        $posted_ringtones = $_POST['uploaded_ringtones'] ?? [];
+        if (is_array($posted_ringtones)) {
+            $formData['uploaded_ringtones'] = array_map('trim', $posted_ringtones);
+        } else {
+            $formData['uploaded_ringtones'] = [];
+        }
+
+        // 2. Re-generate and overwrite the master .template.cfg without the flushed ringtones
+        $generated_template_cfg = "## Yealink Template Configuration File ##\n";
+        $generated_template_cfg .= "# Phone Model: " . ($_POST['phone_model'] ?? 'manual') . "\n";
+        $generated_template_cfg .= "# Expansion Model: " . ($_POST['exp_model'] ?? 'none') . "\n";
+        $generated_template_cfg .= "# Expansion Count: " . ($_POST['exp_count'] ?? '0') . "\n\n";
+        $generated_template_cfg .= "account.1.sip_server = {$saved_global_server_ip}\n";
+        $generated_template_cfg .= "account.1.sip_server_host = {$saved_global_server_ip}\n";
+        $generated_template_cfg .= "account.1.sip_server_port = " . ($_POST['sip_port'] ?? $default_sip_port) . "\n";
+        $generated_template_cfg .= "account.1.port = " . ($_POST['sip_port'] ?? $default_sip_port) . "\n";
+        $generated_template_cfg .= "account.1.sip_listen_port = " . ($_POST['sip_listen_port'] ?? '5062') . "\n";
+        $generated_template_cfg .= "voice_mail.number.1 = " . ($_POST['voicemail_number'] ?? $default_voicemail_ext) . "\n\n";
+        $generated_template_cfg .= "account.1.ringtone.ring_type = " . ($_POST['account_ringtone'] ?? 'Common') . "\n";
+
+        if (!empty($formData['uploaded_ringtones'])) {
+            $generated_template_cfg .= "account.1.alert_info_url_enable = 1\n\n";
+            $host_only = explode(':', $saved_global_server_ip)[0];
+            foreach ($formData['uploaded_ringtones'] as $r_file) {
+                $generated_template_cfg .= "ringtone.url = http://{$host_only}:83/PhoneSettings/ringtones/" . $r_file . "\n";
+            }
+            $generated_template_cfg .= "\n";
+        }
+
+        $generated_template_cfg .= buildDistinctiveRingtoneConfigBlock($formData['uploaded_ringtones']);
+
+        @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
+        @chown($tftp_dir . $tpl_filename, 'asterisk');
+
+        // 3. Rebuild device files with flush directives (%NULL%) and push check-sync
         $flushed_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, true);
+
+        // Mark session flag that a flush command occurred for this template
         $_SESSION['pending_ringtone_flush'][$tpl_filename] = true;
-        $status = "Pushed ringtone flush directive (ringtone.delete = http://localhost/all) and cleared internal ringer text for {$flushed_count} device(s) using template '{$tpl_filename}'.";
+
+        $status = "Pushed ringtone flush directive (%NULL%) to {$flushed_count} device(s) using template '{$tpl_filename}'. Click 'Save Template' to purge temporary flush directives.";
         $_POST['template_to_load'] = $tpl_filename;
         $just_flushed = true;
     }
@@ -1032,7 +1075,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         $generated_template_cfg .= "\n";
     }
 
-    $generated_template_cfg .= buildDistinctiveRingtoneConfigBlock();
+    $generated_template_cfg .= buildDistinctiveRingtoneConfigBlock($formData['uploaded_ringtones']);
 
     $has_memkeys = false;
     for ($i = 1; $i <= $max_memkeys; $i++) {
@@ -1108,12 +1151,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
     @chown($tftp_dir . $tpl_filename, 'asterisk');
 
+    // CONDITIONAL DEVICE REBUILD: Only rebuild devices if a flush occurred previously
     if (!empty($_SESSION['pending_ringtone_flush'][$tpl_filename])) {
         $rebuilt_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, false);
         unset($_SESSION['pending_ringtone_flush'][$tpl_filename]);
-        $status = "Saved Template '{$tpl_filename}' and automatically rebuilt & pushed configurations to {$rebuilt_count} assigned device(s).";
+        $status = "Saved Template: {$tpl_filename}. Rebuilt configurations and removed temporary flush directives from {$rebuilt_count} device(s).";
     } else {
-        $status = "Saved Template: {$tpl_filename} to /tftpboot/. Device CFG files were not modified.";
+        $status = "Saved Template: {$tpl_filename}. Updated template configuration file.";
     }
 
     $_POST['template_to_load'] = $tpl_filename;
@@ -1232,7 +1276,7 @@ if (isset($_POST['load_template']) || !empty($_POST['template_to_load'])) {
     }
 }
 
-if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action']) && !isset($_POST['save_template'])) {
     $action = $_POST['device_action'];
     $selected_macs = $_POST['selected_phones'] ?? [];
     $assigned_tpls = $_POST['phone_template'] ?? [];
@@ -1463,35 +1507,37 @@ foreach ($ringtone_filenames as $rf) {
     }
 }
 
-if (empty($formData['uploaded_ringtones'])) {
+if (!isset($_POST['uploaded_ringtones']) && $_SERVER["REQUEST_METHOD"] !== "POST") {
     $formData['uploaded_ringtones'] = $ringtone_filenames;
 }
 
-if (!$just_flushed && !empty($formData['template_name'])) {
-    $active_tpl_file = strpos($formData['template_name'], '.template.cfg') === false ? $formData['template_name'] . '.template.cfg' : $formData['template_name'];
-    $mac_files = glob($tftp_dir . "*.cfg");
-    
-    if (is_array($mac_files)) {
-        foreach ($mac_files as $mf) {
-            $m_base = strtolower(pathinfo($mf, PATHINFO_FILENAME));
-            if ($m_base === 'y000000000000' || strpos(strtolower($mf), 'template') !== false) {
-                continue;
-            }
+// Extract ringtones currently referenced across [mac].cfg files for JS scanning
+$active_tpl_file = strpos($formData['template_name'], '.template.cfg') === false ? $formData['template_name'] . '.template.cfg' : $formData['template_name'];
+$mac_files = glob($tftp_dir . "*.cfg");
+$assigned_ringtone_references = [];
 
-            $m_content = file_get_contents($mf);
-            if (preg_match('/#\s*Template\s*:\s*' . preg_quote($active_tpl_file, '/') . '/i', $m_content)) {
-                if (preg_match_all('/ringtone\.url\s*=\s*http:\/\/[^\/]+\/PhoneSettings\/ringtones\/([^\s]+)/i', $m_content, $rmatches)) {
-                    foreach ($rmatches[1] as $referenced_ring) {
-                        if (!in_array($referenced_ring, $ringtone_filenames)) {
-                            $show_flush_ringtone_btn = true;
-                            break 2;
-                        }
+if (is_array($mac_files)) {
+    foreach ($mac_files as $mf) {
+        $m_base = strtolower(pathinfo($mf, PATHINFO_FILENAME));
+        if ($m_base === 'y000000000000' || strpos(strtolower($mf), 'template') !== false) {
+            continue;
+        }
+
+        $m_content = file_get_contents($mf);
+        if (preg_match('/#\s*Template\s*:\s*' . preg_quote($active_tpl_file, '/') . '/i', $m_content)) {
+            if (preg_match_all('/ringtone\.url\s*=\s*http:\/\/[^\/]+\/PhoneSettings\/ringtones\/([^\s]+)/i', $m_content, $rmatches)) {
+                foreach ($rmatches[1] as $referenced_ring) {
+                    $assigned_ringtone_references[$referenced_ring] = true;
+                    if (!in_array($referenced_ring, $ringtone_filenames) && !$just_flushed) {
+                        $show_flush_ringtone_btn = true;
                     }
                 }
             }
         }
     }
-} else if ($just_flushed) {
+}
+
+if ($just_flushed) {
     $show_flush_ringtone_btn = false;
 }
 
@@ -1735,13 +1781,23 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
     
     .ringtone-grid-item { 
         display: grid; 
-        grid-template-columns: 220px 100px 1fr; 
+        grid-template-columns: 200px 90px 220px 40px; 
         align-items: center; 
         padding: 6px 0; 
         border-bottom: 1px dashed #e0e0e0; 
+        gap: 10px;
     }
     .ringtone-grid-item:last-child { border-bottom: none; }
     
+    .ringtone-player-controls {
+        display: flex;
+        align-items: center;
+    }
+    .ringtone-player-controls audio {
+        height: 28px;
+        max-width: 210px;
+    }
+
     .ringtone-size-badge { 
         font-size: 12px; 
         font-weight: 600;
@@ -1845,6 +1901,10 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 <script>
     var scannedDeviceMacs = [];
     var ringtoneFileSizes = <?= json_encode($ringtone_file_sizes) ?>;
+    var initialRingtoneStates = {};
+    var ringtoneHttpBase = <?= json_encode($ringtone_http_base) ?>;
+    var assignedRingtoneReferences = <?= json_encode($assigned_ringtone_references) ?>;
+    var initialShowFlushBtn = <?= json_encode($show_flush_ringtone_btn) ?>;
 
     var yealinkModelSpecs = {
         "manual": { ringFormats: ".wav, .mp3", ringSize: "100KB - 2MB", maxRingtone: "10+", totalLimit: 10485760, logoFormat: ".dob, .bmp, .jpg, .png", logoRes: "Variable", logoSize: "Max 2MB" },
@@ -1919,6 +1979,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         }
 
         var sizeFormatted = (filesize > 0) ? (filesize / 1024).toFixed(1) + ' KB' : '0 KB';
+        var fileUrl = ringtoneHttpBase + encodeURIComponent(filename);
         
         var gridItem = document.createElement('div');
         gridItem.className = 'ringtone-grid-item';
@@ -1929,6 +1990,12 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             </label>
             <div>
                 <span class="ringtone-size-badge">(${sizeFormatted})</span>
+            </div>
+            <div class="ringtone-player-controls">
+                <audio controls preload="none" controlsList="nodownload">
+                    <source src="${fileUrl}" type="audio/wav">
+                    <source src="${fileUrl}" type="audio/mpeg">
+                </audio>
             </div>
             <div>
                 <button type="button" class="delete-icon-btn" title="Delete ${filename}" onclick="confirmDeleteFile('${filename}', 'ringtone')">
@@ -2331,7 +2398,24 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                 optElem.style.display = 'none';
             }
         }
+        
+        checkUncheckedRingtonesState();
         calculateTotalRingtonePayloadSize();
+    }
+
+    function checkUncheckedRingtonesState() {
+        var requiresFlush = initialShowFlushBtn;
+
+        document.querySelectorAll('input[name="uploaded_ringtones[]"]').forEach(function(cb) {
+            if (!cb.checked && assignedRingtoneReferences[cb.value] === true) {
+                requiresFlush = true;
+            }
+        });
+
+        var flushBannerContainer = document.getElementById('flush_banner_container');
+        if (flushBannerContainer) {
+            flushBannerContainer.style.display = requiresFlush ? "block" : "none";
+        }
     }
 
     function openScanModal() {
@@ -2535,6 +2619,10 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
     });
 
     document.addEventListener("DOMContentLoaded", function() {
+        document.querySelectorAll('input[name="uploaded_ringtones[]"]').forEach(function(cb) {
+            initialRingtoneStates[cb.value] = cb.checked;
+        });
+
         if (window.location.hash === '#tab_devices' || '<?= $formData['active_tab'] ?>' === 'tab_devices') {
             switchTab('tab_devices');
         } else if (window.location.hash === '#tab_template' || '<?= $formData['active_tab'] ?>' === 'tab_template' || window.location.hash === '#ringtone_section') {
@@ -2921,7 +3009,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             </form>
         </div>
 
-        <form id="template_cfg_form" action="?display=yealink_epm#ringtone_section" method="POST" enctype="multipart/form-data">
+        <form id="template_cfg_form" action="?display=yealink_epm" method="POST" enctype="multipart/form-data">
             <input type="hidden" name="active_tab" value="tab_template">
             <input type="hidden" name="current_loaded_template" value="<?= htmlspecialchars($formData['template_name']) ?>">
 
@@ -3031,18 +3119,16 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             <div id="ringtone_section"></div>
             <h3 class="gen-section-title">Ringtone Management & Provisioning</h3>
 
-            <?php if ($show_flush_ringtone_btn && !empty($formData['template_name'])): ?>
-                <div class="flush-banner">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <strong>&#9888; Missing Ringtone(s) Detected in Phone Configs:</strong> One or more device <code>[mac].cfg</code> files assigned to this template reference ringtones that have been deleted from the server. Click below to issue a flush directive and sync all affected phones.
-                        </div>
-                        <button type="submit" name="flush_template_ringtones" class="gen-btn-danger" style="margin:0; white-space:nowrap; padding:8px 14px; font-weight:bold;">
-                            Flush Ringtones From Phones
-                        </button>
+            <div id="flush_banner_container" class="flush-banner" style="display: <?= ($show_flush_ringtone_btn && !empty($formData['template_name'])) ? 'block' : 'none' ?>;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <strong>&#9888; Unreferenced / Deleted Ringtone(s) Detected in Phone Configs:</strong> One or more device <code>[mac].cfg</code> files assigned to this template reference ringtones that have been deleted or unchecked. Click below to issue a flush directive and sync all affected phones.
                     </div>
+                    <button type="submit" name="flush_template_ringtones" class="gen-btn-danger" style="margin:0; white-space:nowrap; padding:8px 14px; font-weight:bold;" onclick="this.form.action='?display=yealink_epm#ringtone_section';">
+                        Flush Ringtones From Phones
+                    </button>
                 </div>
-            <?php endif; ?>
+            </div>
 
             <div class="ringtone-card">
                 <label style="margin-top:0;">1. Provision Uploaded Sound Files to Phone:</label>
@@ -3058,6 +3144,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                             $is_checked = in_array($r_file, $formData['uploaded_ringtones']);
                             $f_size = $ringtone_file_sizes[$r_file] ?? 0;
                             $size_formatted = ($f_size > 0) ? round($f_size / 1024, 1) . ' KB' : '0 KB';
+                            $file_url = $ringtone_http_base . rawurlencode($r_file);
                         ?>
                             <div class="ringtone-grid-item">
                                 <label style="font-weight:normal; margin:0; display:flex; align-items:center;">
@@ -3067,6 +3154,13 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 
                                 <div>
                                     <span class="ringtone-size-badge">(<?= $size_formatted ?>)</span>
+                                </div>
+
+                                <div class="ringtone-player-controls">
+                                    <audio controls preload="none" controlsList="nodownload">
+                                        <source src="<?= $file_url ?>" type="audio/wav">
+                                        <source src="<?= $file_url ?>" type="audio/mpeg">
+                                    </audio>
                                 </div>
 
                                 <div>
