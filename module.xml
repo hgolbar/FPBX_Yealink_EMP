@@ -1,7 +1,7 @@
 <module>
 	<rawname>yealink_epm</rawname>
 	<name>Yealink Endpoint Manager</name>
-	<version>1.0.0.7</version>
+	<version>1.0.0.8</version>
 	<publisher>HG</publisher>
 	<license>GPLv3</license>
 	<type>setup</type>
