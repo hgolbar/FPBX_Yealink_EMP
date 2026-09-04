@@ -232,12 +232,6 @@ function buildDistinctiveRingtoneConfigBlock() {
             $cfg .= "account.1.alert_info_text.{$r_idx} = {$text_name}\n";
             $cfg .= "account.1.alert_info_ringer.{$r_idx} = {$r_file}\n";
             $legacy_index++;
-        } else {
-            // Explicitly force %NULL% to wipe unused/cleared slots in NVRAM
-            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.text = %NULL%\n";
-            $cfg .= "distinctive_ring_tones.alert_info.{$r_idx}.ringer = %NULL%\n";
-            $cfg .= "account.1.alert_info_text.{$r_idx} = %NULL%\n";
-            $cfg .= "account.1.alert_info_ringer.{$r_idx} = %NULL%\n";
         }
     }
     $cfg .= "######## END DISTINCTIVE RINGTONE SETUP ########\n\n";
@@ -295,7 +289,6 @@ function rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin
                 $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
 
                 if ($append_flush) {
-                    // Strip the active distinctive block so it doesn't immediately overwrite the flush
                     $tpl_content = preg_replace('/######## DISTINCTIVE RINGTONE & ALERT INFO SETUP ########.*?######## END DISTINCTIVE RINGTONE SETUP ########/s', '', $tpl_content);
 
                     $flush_block = "######## ONE-TIME RINGTONE FLASH CLEAR ########\n";
@@ -754,6 +747,27 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
     $should_notify = isset($_POST['auto_provision']) && $_POST['auto_provision'] === '1';
 
     if (!empty($scanned_mac)) {
+        if (!empty($scanned_ext)) {
+            $existing_cfgs = glob($tftp_dir . "*.cfg");
+            if (is_array($existing_cfgs)) {
+                foreach ($existing_cfgs as $ecfg) {
+                    $emac = strtolower(pathinfo($ecfg, PATHINFO_FILENAME));
+                    if ($emac === 'y000000000000' || strpos($emac, 'template') !== false || $emac === $scanned_mac) {
+                        continue;
+                    }
+                    $elines = @file($ecfg, FILE_IGNORE_NEW_LINES);
+                    if ($elines) {
+                        foreach ($elines as $el) {
+                            if (preg_match('/^account\.1\.(auth_name|user_name)\s*=\s*' . preg_quote($scanned_ext, '/') . '$/i', trim($el))) {
+                                echo json_encode(['status' => 'error', 'message' => "Extension {$scanned_ext} is already assigned to MAC {$emac}."]);
+                                exit;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         $ext_name = $all_extensions[$scanned_ext]['display_name'] ?? "Extension {$scanned_ext}";
         $ext_secret = $all_extensions[$scanned_ext]['secret'] ?? '';
         $tpl_to_write = !empty($scanned_tpl) ? $scanned_tpl : 'none';
@@ -845,7 +859,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
     }
 }
 
-// Handle Template Specific Flush Ringtones Request
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_ringtones'])) {
     $target_tpl = trim($_POST['template_name'] ?? '');
     if (!empty($target_tpl)) {
@@ -1081,6 +1094,17 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
         $generated_template_cfg .= trim($formData['custom_inputs']) . "\n\n";
     }
 
+    // Filter out %NULL% lines and empty/whitespace-only key-value pairs before saving
+    $cleaned_lines = [];
+    foreach (explode("\n", $generated_template_cfg) as $line) {
+        $trimmed = trim($line);
+        if (preg_match('/^[^=]+=\s*(%NULL%|\s*)$/i', $trimmed)) {
+            continue;
+        }
+        $cleaned_lines[] = $line;
+    }
+    $generated_template_cfg = implode("\n", $cleaned_lines);
+
     @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
     @chown($tftp_dir . $tpl_filename, 'asterisk');
 
@@ -1215,6 +1239,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
     $assigned_exts = $_POST['phone_extension'] ?? [];
     $edited_macs = $_POST['edited_mac'] ?? [];
     $bulk_override_tpl = trim($_POST['bulk_selected_template'] ?? '');
+
+    if (in_array($action, ['rebuild_selected', 'rebuild_all', 'rebuild_filtered'])) {
+        $filtered_exts = array_filter($assigned_exts);
+        if (count($filtered_exts) !== count(array_unique($filtered_exts))) {
+            $status = "<span style='color:#dc3545;'><b>Error:</b> Duplicate extensions detected in submission! Each phone must have a unique extension assigned.</span>";
+            goto skip_device_rebuild;
+        }
+    }
 
     foreach ($edited_macs as $orig_mac => $new_mac) {
         $clean_orig = strtolower(trim($orig_mac));
@@ -1410,6 +1442,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action'])) {
             $status = "Sent reboot NOTIFY to Extension {$single_ext}.";
         }
     }
+
+    skip_device_rebuild:;
 }
 
 // ============================================================================
@@ -1433,7 +1467,6 @@ if (empty($formData['uploaded_ringtones'])) {
     $formData['uploaded_ringtones'] = $ringtone_filenames;
 }
 
-// Scan device mac.cfg files for references to ringtones no longer in /ringtones/
 if (!$just_flushed && !empty($formData['template_name'])) {
     $active_tpl_file = strpos($formData['template_name'], '.template.cfg') === false ? $formData['template_name'] . '.template.cfg' : $formData['template_name'];
     $mac_files = glob($tftp_dir . "*.cfg");
@@ -1606,7 +1639,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
     .gen-textarea { width: 100%; height: 220px; font-family: monospace; margin-top: 5px; box-sizing: border-box; }
     .gen-alert { background: #d4edda; color: #155724; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
     
-    /* Tab Navigation Bar */
     .gen-tab-bar { 
         display: flex; 
         border-bottom: 2px solid #007bff; 
@@ -1619,7 +1651,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         padding-bottom: 5px; 
     }
 
-    /* Sticky Active Template Banner Extended Width */
     .gen-load-box { 
         background: #f8f9fa; 
         padding: 10px 14px; 
@@ -1642,7 +1673,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         color: #333;
     }
 
-    /* Active / Edit Template Select Styling & Dropdown Sans-Serif Overrides */
     .gen-load-box select {
         padding: 8px !important;
         height: 36px !important;
@@ -1675,7 +1705,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         margin-top: 0 !important;
     }
 
-    /* Scroll Offset Anchor */
     #ringtone_section {
         scroll-margin-top: 120px;
     }
@@ -1701,7 +1730,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
     .oss-btn-icon.online { color: #28a745; }
     .oss-btn-icon.offline { color: #dc3545; }
 
-    /* Ringtone Management Custom Styles */
     .ringtone-card { border: 1px solid #ccc; border-radius: 6px; padding: 12px; background: #fafafa; margin-top: 10px; }
     .ringtone-list-container { border: 1px solid #e0e0e0; background: #fff; border-radius: 4px; padding: 4px 10px; margin-top: 8px; }
     
@@ -1841,6 +1869,31 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         "T58A":   { ringFormats: ".wav, .mp3", ringSize: "Max 5MB", maxRingtone: "15", totalLimit: 20971520, logoFormat: ".jpg, .png, .bmp", logoRes: "1024 x 600", logoSize: "Max 5MB" },
         "VP59":   { ringFormats: ".wav, .mp3", ringSize: "Max 5MB", maxRingtone: "15", totalLimit: 20971520, logoFormat: ".jpg, .png, .bmp", logoRes: "1280 x 800", logoSize: "Max 5MB" }
     };
+
+    function enforceUniqueExtensionSelections() {
+        var selects = document.querySelectorAll('select[name^="phone_extension"], select[id^="scan_ext_"], #manual_ext');
+        var selectedValues = [];
+
+        selects.forEach(function(sel) {
+            if (sel.value && sel.value !== '') {
+                selectedValues.push(sel.value);
+            }
+        });
+
+        selects.forEach(function(sel) {
+            var currentVal = sel.value;
+            Array.from(sel.options).forEach(function(opt) {
+                if (!opt.value) return;
+                if (opt.value !== currentVal && selectedValues.includes(opt.value)) {
+                    opt.disabled = true;
+                    opt.style.color = '#bbb';
+                } else {
+                    opt.disabled = false;
+                    opt.style.color = '';
+                }
+            });
+        });
+    }
 
     function formatBytes(bytes) {
         if (bytes === 0) return '0 KB';
@@ -2287,7 +2340,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 
     function closeScanModal() {
         document.getElementById('scanModal').style.display = 'none';
-        window.location.href = window.location.pathname + '?display=yealink_epm#tab_devices';
+        window.location.href = window.location.pathname + '?display=yealink_epm&_r=' + Date.now() + '#tab_devices';
     }
 
     function openManualAddModal() {
@@ -2295,11 +2348,12 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         document.getElementById('manual_ext').value = '';
         document.getElementById('manual_tpl').value = '';
         document.getElementById('manualAddModal').style.display = 'block';
+        enforceUniqueExtensionSelections();
     }
 
     function closeManualAddModal() {
         document.getElementById('manualAddModal').style.display = 'none';
-        window.location.href = window.location.pathname + '?display=yealink_epm#tab_devices';
+        window.location.href = window.location.pathname + '?display=yealink_epm&_r=' + Date.now() + '#tab_devices';
     }
 
     function submitManualAddDevice() {
@@ -2399,6 +2453,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                     </tr>`;
                     tbody.innerHTML += row;
                 });
+                enforceUniqueExtensionSelections();
             })
             .catch(err => {
                 tbody.innerHTML = '<tr><td colspan="6">Scan failed or timed out.</td></tr>';
@@ -2438,7 +2493,9 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                 if (row) row.style.background = '#d4edda';
                 btn.innerHTML = 'Added &#10003;';
                 btn.style.background = '#6c757d';
+                enforceUniqueExtensionSelections();
             } else {
+                alert(data.message || 'Error adding device.');
                 btn.disabled = false;
                 btn.innerText = 'Error! Try Again';
                 btn.style.background = '#dc3545';
@@ -2467,9 +2524,15 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             btn.innerText = 'Done!';
             setTimeout(() => {
                 closeScanModal();
-            }, 800);
+            }, 300);
         });
     }
+
+    document.addEventListener('change', function(e) {
+        if (e.target && (e.target.name?.startsWith('phone_extension') || e.target.id?.startsWith('scan_ext_') || e.target.id === 'manual_ext')) {
+            enforceUniqueExtensionSelections();
+        }
+    });
 
     document.addEventListener("DOMContentLoaded", function() {
         if (window.location.hash === '#tab_devices' || '<?= $formData['active_tab'] ?>' === 'tab_devices') {
@@ -2482,6 +2545,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             }
         }
         updateModelSpecsInfo(document.getElementById('select_phone_model').value);
+        enforceUniqueExtensionSelections();
     });
 </script>
 
@@ -2996,18 +3060,15 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                             $size_formatted = ($f_size > 0) ? round($f_size / 1024, 1) . ' KB' : '0 KB';
                         ?>
                             <div class="ringtone-grid-item">
-                                <!-- Column 1: Checkbox & Name -->
                                 <label style="font-weight:normal; margin:0; display:flex; align-items:center;">
                                     <input type="checkbox" name="uploaded_ringtones[]" value="<?= htmlspecialchars($r_file) ?>" <?= $is_checked ? 'checked' : '' ?> onchange="syncRingtoneOptions(this, '<?= htmlspecialchars($r_file) ?>')">
                                     <span style="margin-left:8px; font-weight:500; text-overflow:ellipsis; overflow:hidden; white-space:nowrap;"><?= htmlspecialchars($r_file) ?></span>
                                 </label>
 
-                                <!-- Column 2: Size Badge -->
                                 <div>
                                     <span class="ringtone-size-badge">(<?= $size_formatted ?>)</span>
                                 </div>
 
-                                <!-- Column 3: Trash Icon Button -->
                                 <div>
                                     <button type="button" class="delete-icon-btn" title="Delete <?= htmlspecialchars($r_file) ?>" onclick="confirmDeleteFile('<?= htmlspecialchars($r_file) ?>', 'ringtone')">
                                         <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -3023,7 +3084,6 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                     <?php endif; ?>
                 </div>
 
-                <!-- Total Selected Payload -->
                 <div id="ringtone_payload_summary" style="font-size:12px; color:#333; margin-top:8px; text-align:left;">Total Selected Payload: 0 KB</div>
 
                 <div id="ringtone_overlimit_warning" class="warning-box" style="display:none;"></div>
@@ -3032,16 +3092,13 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                     <label style="margin-top:0; margin-bottom:8px;">Upload New Ringtones:</label>
                     
                     <div class="upload-controls-col">
-                        <!-- Browse Button -->
                         <label for="ringtone_file_input" class="custom-file-btn">Browse Files</label>
                         <input type="file" id="ringtone_file_input" accept=".wav,.mp3" multiple style="display:none;" onchange="updateVerticalFileList(this)">
                         
-                        <!-- Async Upload Button (Positioned Directly Underneath Browse) -->
                         <button type="button" id="async_upload_btn" onclick="uploadRingtonesAsync(event)" class="upload-btn-aligned">
                             Upload Ringtones
                         </button>
 
-                        <!-- Multi-line Selected Files Display -->
                         <textarea id="selected_files_textarea" readonly placeholder="No files selected"></textarea>
                     </div>
                 </div>
