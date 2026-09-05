@@ -856,9 +856,14 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['upload_template_file']
         $ext_check = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
 
         if ($ext_check === 'cfg' || $ext_check === 'template') {
-            $clean_basename = preg_replace('/[^a-zA-Z0-9_\-]/', '', pathinfo($orig_name, PATHINFO_FILENAME));
-            $clean_basename = str_replace('_template', '', $clean_basename);
+            // Strip .template.cfg, .cfg, .template, or trailing _template / -template / template from the name
+            $clean_basename = preg_replace('/(\.template)?\.cfg$/i', '', $orig_name);
+            $clean_basename = preg_replace('/(\.template|\.cfg|_template|-template|template)$/i', '', $clean_basename);
+            
+            $clean_basename = preg_replace('/[^a-zA-Z0-9_\-]/', '', $clean_basename);
             if (empty($clean_basename)) { $clean_basename = "uploaded_template"; }
+
+            // Cleanly append single .template.cfg
             $target_filename = $clean_basename . ".template.cfg";
             $destination_path = $template_dir . $target_filename;
 
