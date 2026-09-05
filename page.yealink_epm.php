@@ -25,12 +25,13 @@ $generated_common_cfg = "";
 $generated_template_cfg = "";
 $status = "";
 $tftp_dir = "/tftpboot/";
+$template_dir = "/tftpboot/templates/";
 $logo_dir = "/var/www/html/PhoneSettings/logo/";
 $ringtone_dir = "/var/www/html/PhoneSettings/ringtones/";
 $ringtone_was_deleted = false;
 $just_flushed = false;
 
-foreach ([$logo_dir, $ringtone_dir] as $dir) {
+foreach ([$logo_dir, $ringtone_dir, $template_dir] as $dir) {
     if (!file_exists($dir)) {
         @mkdir($dir, 0775, true);
         @chown($dir, 'asterisk');
@@ -146,7 +147,29 @@ $builtin_ringtones = [
 ];
 
 // ============================================================================
-// 4. HELPER FUNCTIONS
+// 4. DOWNLOAD TEMPLATE ACTION
+// ============================================================================
+
+if (isset($_GET['action']) && $_GET['action'] === 'download_template' && !empty($_GET['file'])) {
+    $dl_file = basename($_GET['file']);
+    $dl_path = $template_dir . $dl_file;
+
+    if (file_exists($dl_path) && is_file($dl_path)) {
+        if (ob_get_length()) { ob_clean(); }
+        header('Content-Description: File Transfer');
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . $dl_file . '"');
+        header('Expires: 0');
+        header('Cache-Control: must-revalidate');
+        header('Pragma: public');
+        header('Content-Length: ' . filesize($dl_path));
+        readfile($dl_path);
+        exit;
+    }
+}
+
+// ============================================================================
+// 5. HELPER FUNCTIONS
 // ============================================================================
 
 function getArpTableMap() {
@@ -242,8 +265,9 @@ function buildDistinctiveRingtoneConfigBlock($active_ringtones = []) {
     return $cfg;
 }
 
-function rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, $append_flush = false) {
-    if (empty($tpl_filename) || !file_exists($tftp_dir . $tpl_filename)) {
+function rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $template_dir, $saved_global_admin_pass, $append_flush = false) {
+    $tpl_path = $template_dir . $tpl_filename;
+    if (empty($tpl_filename) || !file_exists($tpl_path)) {
         return 0;
     }
 
@@ -288,7 +312,7 @@ function rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin
                     $base_content = substr($base_content, 0, $pos_flush);
                 }
 
-                $tpl_content = file_get_contents($tftp_dir . $tpl_filename);
+                $tpl_content = file_get_contents($tpl_path);
                 $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
                 $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
 
@@ -431,7 +455,7 @@ function generateAndSaveGlobalConfig($formData, $cfg_version, $default_server_ta
 }
 
 // ============================================================================
-// 5. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
+// 6. READ GLOBAL CONFIGURATION (y000000000000.cfg) & DATABASE DATA
 // ============================================================================
 
 $saved_global_server_ip = $default_server_target;
@@ -639,7 +663,7 @@ if (isset($pdo)) {
 ksort($all_extensions);
 
 // ============================================================================
-// 6. AJAX ENDPOINTS
+// 7. AJAX ENDPOINTS
 // ============================================================================
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['single_ringtone_ajax'])) {
@@ -796,8 +820,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
             $cfg_body .= "linekey.1.label = {$ext_name}\n\n";
         }
 
-        if (!empty($scanned_tpl) && file_exists($tftp_dir . $scanned_tpl)) {
-            $tpl_content = file_get_contents($tftp_dir . $scanned_tpl);
+        if (!empty($scanned_tpl) && file_exists($template_dir . $scanned_tpl)) {
+            $tpl_content = file_get_contents($template_dir . $scanned_tpl);
             $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
             $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
             $cfg_body .= "##### INHERITED TEMPLATE SETTINGS ({$scanned_tpl}) #####\n";
@@ -822,8 +846,36 @@ if (isset($_GET['action']) && $_GET['action'] === 'add_scanned_device') {
 }
 
 // ============================================================================
-// 7. POST ACTIONS (DELETE HANDLER & TEMPLATE FLUSH HANDLER)
+// 8. POST ACTIONS (DELETE HANDLER, UPLOAD TEMPLATE, TEMPLATE FLUSH HANDLER)
 // ============================================================================
+
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['upload_template_file'])) {
+    $_POST['active_tab'] = 'tab_template';
+    if (isset($_FILES['template_upload']) && $_FILES['template_upload']['error'] === UPLOAD_ERR_OK) {
+        $orig_name = basename($_FILES['template_upload']['name']);
+        $ext_check = strtolower(pathinfo($orig_name, PATHINFO_EXTENSION));
+
+        if ($ext_check === 'cfg' || $ext_check === 'template') {
+            $clean_basename = preg_replace('/[^a-zA-Z0-9_\-]/', '', pathinfo($orig_name, PATHINFO_FILENAME));
+            $clean_basename = str_replace('_template', '', $clean_basename);
+            if (empty($clean_basename)) { $clean_basename = "uploaded_template"; }
+            $target_filename = $clean_basename . ".template.cfg";
+            $destination_path = $template_dir . $target_filename;
+
+            if (move_uploaded_file($_FILES['template_upload']['tmp_name'], $destination_path)) {
+                @chown($destination_path, 'asterisk');
+                $status = "Successfully uploaded template '{$target_filename}' into /tftpboot/templates/";
+                $_POST['template_to_load'] = $target_filename;
+            } else {
+                $status = "<span style='color:#dc3545;'><b>Error:</b> Failed to move uploaded template to {$template_dir}</span>";
+            }
+        } else {
+            $status = "<span style='color:#dc3545;'><b>Error:</b> Invalid template file extension. Must be a .cfg or .template.cfg file.</span>";
+        }
+    } else {
+        $status = "<span style='color:#dc3545;'><b>Error:</b> No valid template file selected for upload.</span>";
+    }
+}
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) && !empty($_POST['target_filename'])) {
     $target_file = basename($_POST['target_filename']);
@@ -835,7 +887,9 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['delete_target_file']) 
 
     if ($file_type === 'global') {
         $full_path = $tftp_dir . "y000000000000.cfg";
-    } elseif ($file_type === 'cfg' || $file_type === 'template') {
+    } elseif ($file_type === 'template') {
+        $full_path = $template_dir . $target_file;
+    } elseif ($file_type === 'cfg') {
         $full_path = $tftp_dir . $target_file;
     } elseif ($file_type === 'logo') {
         $full_path = $logo_dir . $target_file;
@@ -880,7 +934,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_rington
             $formData['uploaded_ringtones'] = [];
         }
 
-        // 2. Re-generate and overwrite the master .template.cfg without the flushed ringtones
+        // 2. Re-generate and overwrite the master .template.cfg inside /tftpboot/templates/
         $generated_template_cfg = "## Yealink Template Configuration File ##\n";
         $generated_template_cfg .= "# Phone Model: " . ($_POST['phone_model'] ?? 'manual') . "\n";
         $generated_template_cfg .= "# Expansion Model: " . ($_POST['exp_model'] ?? 'none') . "\n";
@@ -904,11 +958,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_rington
 
         $generated_template_cfg .= buildDistinctiveRingtoneConfigBlock($formData['uploaded_ringtones']);
 
-        @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
-        @chown($tftp_dir . $tpl_filename, 'asterisk');
+        @file_put_contents($template_dir . $tpl_filename, $generated_template_cfg);
+        @chown($template_dir . $tpl_filename, 'asterisk');
 
         // 3. Rebuild device files with flush directives (%NULL%) and push check-sync
-        $flushed_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, true);
+        $flushed_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $template_dir, $saved_global_admin_pass, true);
 
         // Mark session flag that a flush command occurred for this template
         $_SESSION['pending_ringtone_flush'][$tpl_filename] = true;
@@ -920,7 +974,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['flush_template_rington
 }
 
 // ============================================================================
-// 8. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
+// 9. FORM DATA INITIALIZATION & SAVE TEMPLATE HANDLER
 // ============================================================================
 
 $max_linekeys = isset($_POST['linekey_count']) ? (int)$_POST['linekey_count'] : 1;
@@ -1148,30 +1202,30 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['save_template'])) {
     }
     $generated_template_cfg = implode("\n", $cleaned_lines);
 
-    @file_put_contents($tftp_dir . $tpl_filename, $generated_template_cfg);
-    @chown($tftp_dir . $tpl_filename, 'asterisk');
+    @file_put_contents($template_dir . $tpl_filename, $generated_template_cfg);
+    @chown($template_dir . $tpl_filename, 'asterisk');
 
     // CONDITIONAL DEVICE REBUILD: Only rebuild devices if a flush occurred previously
     if (!empty($_SESSION['pending_ringtone_flush'][$tpl_filename])) {
-        $rebuilt_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $saved_global_admin_pass, false);
+        $rebuilt_count = rebuildDevicesForTemplate($tpl_filename, $tftp_dir, $template_dir, $saved_global_admin_pass, false);
         unset($_SESSION['pending_ringtone_flush'][$tpl_filename]);
         $status = "Saved Template: {$tpl_filename}. Rebuilt configurations and removed temporary flush directives from {$rebuilt_count} device(s).";
     } else {
-        $status = "Saved Template: {$tpl_filename}. Updated template configuration file.";
+        $status = "Saved Template: {$tpl_filename}. Updated template configuration file in /tftpboot/templates/.";
     }
 
     $_POST['template_to_load'] = $tpl_filename;
 }
 
 // ============================================================================
-// 9. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
+// 10. DEVICE MANAGER ACTIONS & TEMPLATE FILE LOADERS
 // ============================================================================
 
 $show_flush_ringtone_btn = $ringtone_was_deleted;
 
 if (isset($_POST['load_template']) || !empty($_POST['template_to_load'])) {
     $tpl_filename = basename($_POST['template_to_load'] ?? '');
-    $tpl_path = $tftp_dir . $tpl_filename;
+    $tpl_path = $template_dir . $tpl_filename;
 
     if (!empty($tpl_filename) && file_exists($tpl_path)) {
         $formData['active_tab'] = 'tab_template';
@@ -1461,8 +1515,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['device_action']) && !i
 
                 $final_cfg = implode("\n", $updated_lines);
 
-                if (!empty($new_tpl) && file_exists($tftp_dir . $new_tpl)) {
-                    $tpl_content = file_get_contents($tftp_dir . $new_tpl);
+                if (!empty($new_tpl) && file_exists($template_dir . $new_tpl)) {
+                    $tpl_content = file_get_contents($template_dir . $new_tpl);
                     $tpl_content = preg_replace('/^account\.1\.sip_server.*$/m', '', $tpl_content);
                     $tpl_content = preg_replace('/^#!version:.*$/m', '', $tpl_content);
                     $final_cfg = rtrim($final_cfg) . "\n\n##### INHERITED TEMPLATE SETTINGS ({$new_tpl}) #####\n" . $tpl_content;
@@ -1542,22 +1596,25 @@ if ($just_flushed) {
 }
 
 $existing_files = glob($tftp_dir . "*.cfg");
+$existing_templates = glob($template_dir . "*.cfg");
 $available_templates = [];
 $managed_devices = [];
 $assigned_extensions_map = [];
 $arp_table = getArpTableMap();
+
+if (is_array($existing_templates)) {
+    foreach ($existing_templates as $tpl_path) {
+        $tb_name = basename($tpl_path);
+        $available_templates[$tb_name] = $tb_name;
+    }
+}
 
 if (is_array($existing_files)) {
     foreach ($existing_files as $file_path) {
         $b_name = basename($file_path);
         $file_name_no_ext = strtolower(pathinfo($b_name, PATHINFO_FILENAME));
         
-        if ($file_name_no_ext === 'y000000000000') continue;
-
-        if (strpos(strtolower($b_name), 'template') !== false) {
-            $available_templates[$b_name] = $b_name;
-            continue;
-        }
+        if ($file_name_no_ext === 'y000000000000' || strpos(strtolower($b_name), 'template') !== false) continue;
 
         $ext_num = "";
         $ext_label = "";
@@ -1670,7 +1727,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 ?>
 
 <!-- ============================================================================ -->
-<!-- 10. HTML VIEW & STYLES                                                       -->
+<!-- 11. HTML VIEW & STYLES                                                       -->
 <!-- ============================================================================ -->
 
 <style>
@@ -1707,7 +1764,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         z-index: 99;
         border: 1px solid #ced4da;
         display: block;
-        width: 730px;
+        width: 820px;
         box-sizing: border-box;
     }
 
@@ -1895,7 +1952,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 </style>
 
 <!-- ============================================================================ -->
-<!-- 11. JAVASCRIPT CONTROLLERS                                                  -->
+<!-- 12. JAVASCRIPT CONTROLLERS                                                  -->
 <!-- ============================================================================ -->
 
 <script>
@@ -1929,6 +1986,16 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
         "T58A":   { ringFormats: ".wav, .mp3", ringSize: "Max 5MB", maxRingtone: "15", totalLimit: 20971520, logoFormat: ".jpg, .png, .bmp", logoRes: "1024 x 600", logoSize: "Max 5MB" },
         "VP59":   { ringFormats: ".wav, .mp3", ringSize: "Max 5MB", maxRingtone: "15", totalLimit: 20971520, logoFormat: ".jpg, .png, .bmp", logoRes: "1280 x 800", logoSize: "Max 5MB" }
     };
+
+    function downloadSelectedTemplate() {
+        var sel = document.getElementById('select_template_file');
+        var val = sel ? sel.value : '';
+        if (!val) {
+            alert("Please select a template to download first.");
+            return;
+        }
+        window.location.href = window.location.pathname + '?display=yealink_epm&action=download_template&file=' + encodeURIComponent(val);
+    }
 
     function enforceUniqueExtensionSelections() {
         var selects = document.querySelectorAll('select[name^="phone_extension"], select[id^="scan_ext_"], #manual_ext');
@@ -2105,7 +2172,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 
     function confirmDeleteFile(filename, fileType) {
         if (!filename || filename === 'system') {
-            alert("Please select a valid custom file to delete.");
+            alert("Please select a valid file to delete.");
             return false;
         }
         if (confirm("Are you sure you want to permanently delete '" + filename + "' from the server?")) {
@@ -2768,7 +2835,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
 </div>
 
 <!-- ============================================================================ -->
-<!-- 12. TABBED UI LAYOUT                                                         -->
+<!-- 13. TABBED UI LAYOUT                                                         -->
 <!-- ============================================================================ -->
 
 <div class="gen-container">
@@ -3004,7 +3071,17 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
                         <?php endforeach; ?>
                     </select>
                     <button type="submit" name="load_template" class="gen-btn" style="margin-top:0; background:#6c757d;">Load</button>
+                    <button type="button" class="gen-btn" style="margin-top:0; background:#17a2b8;" onclick="downloadSelectedTemplate()">Download</button>
                     <button type="button" class="gen-btn-danger" style="margin-top:0;" onclick="confirmDeleteFile(document.getElementById('select_template_file').value, 'template')">Delete</button>
+                </div>
+            </form>
+            
+            <form method="POST" enctype="multipart/form-data" style="margin-top:10px; border-top:1px dashed #ccc; padding-top:8px;">
+                <input type="hidden" name="active_tab" value="tab_template">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <label style="margin:0; font-weight:bold; white-space:nowrap; font-size:12px;">Upload External Template:</label>
+                    <input type="file" name="template_upload" accept=".cfg,.template.cfg" style="padding:4px; font-size:12px;">
+                    <button type="submit" name="upload_template_file" class="gen-btn" style="margin:0; padding:6px 12px; font-size:12px; background:#28a745;">Upload Template File</button>
                 </div>
             </form>
         </div>
@@ -3259,7 +3336,7 @@ $logo_filenames = array_map('basename', is_array($existing_logos) ? $existing_lo
             <?php endif; ?>
 
             <br>
-            <button type="submit" id="save_template_btn" name="save_template" class="gen-btn" style="background: #28a745;">Save Template to /tftpboot/</button>
+            <button type="submit" id="save_template_btn" name="save_template" class="gen-btn" style="background: #28a745;">Save Template to /tftpboot/templates/</button>
         </form>
     </div>
 
